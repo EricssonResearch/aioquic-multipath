@@ -199,12 +199,19 @@ class QuicConnectionState(Enum):
     TERMINATED = 4
 
 
-class QuicNetworkPath:
-    def __init__(self, addr: NetworkAddress, is_validated: bool = False):
-        self.addr: NetworkAddress = addr
+class PathTuple:
+    def __init__(
+        self, 
+        local_addr: NetworkAddress, 
+        remote_addr: NetworkAddress, 
+        is_validated: bool = False
+    ):
+        self.local_addr: NetworkAddress = local_addr
+        self.remote_addr: NetworkAddress = remote_addr
         self.bytes_received: int = 0
         self.bytes_sent: int = 0
         self.is_validated: bool = is_validated
+        self.local_challenges: Deque[bytes] = deque()
         self.local_challenge_sent: bool = False
         self.remote_challenges: Deque[bytes] = deque()
 
@@ -212,11 +219,43 @@ class QuicNetworkPath:
         return self.is_validated or (self.bytes_sent + size) <= 3 * self.bytes_received
 
 
+class QuicNetworkPath:
+    def __init__(
+        self,
+        path_id: int,
+        host_cid: QuicConnectionId,
+        loss: QuicPacketRecovery,
+        peer_cid: Optional[QuicConnectionId] = None,
+    ):
+        self.path_id: int = path_id
+        self.host_cid=host_cid.cid
+        self.host_cids: List[QuicConnectionId] = [host_cid]
+        self.host_cid_seq: int = 1
+        self.peer_cid: QuicConnectionId = peer_cid
+        self.path_tuples: List[PathTuple] = []
+        self.active_path_tuple: Optional[PathTuple] = None
+        self.pacing_at: Optional[float] = None
+        self.packet_number: int = 0
+        self.peer_cid_available: List[QuicConnectionId] = []
+        self.peer_cid_sequence_numbers: Set[int] = set([0])
+        self.peer_retire_prior_to = 0
+        self.loss = loss
+        self.loss_at: Optional[float] = None
+        self.spaces: Dict[tls.Epoch, QuicPacketSpace] = {}
+
+        # things to send
+        self.probe_pending = False
+        self.retire_connection_ids: List[int] = []
+        self.close_at: Optional[float] = None
+
+
 @dataclass
 class QuicReceiveContext:
     epoch: tls.Epoch
     host_cid: bytes
-    network_path: QuicNetworkPath
+    local_addr: NetworkAddress
+    remote_addr: NetworkAddress
+    path_id: int
     quic_logger_frames: Optional[List[Any]]
     time: float
     version: Optional[int]
@@ -302,20 +341,8 @@ class QuicConnection:
         self._events: Deque[events.QuicEvent] = deque()
         self._handshake_complete = False
         self._handshake_confirmed = False
-        self._host_cids = [
-            QuicConnectionId(
-                cid=os.urandom(configuration.connection_id_length),
-                sequence_number=0,
-                stateless_reset_token=os.urandom(16) if not self._is_client else None,
-                was_sent=True,
-            )
-        ]
-        self.host_cid = self._host_cids[0].cid
-        self._host_cid_seq = 1
         self._local_ack_delay_exponent = 3
         self._local_active_connection_id_limit = 8
-        self._local_challenges: Dict[bytes, QuicNetworkPath] = {}
-        self._local_initial_source_connection_id = self._host_cids[0].cid
         self._local_max_data = Limit(
             frame_type=QuicFrameType.MAX_DATA,
             name="max_data",
@@ -334,17 +361,8 @@ class QuicConnection:
         )
         self._local_next_stream_id_bidi = 0 if self._is_client else 1
         self._local_next_stream_id_uni = 2 if self._is_client else 3
-        self._loss_at: Optional[float] = None
         self._max_datagram_size = configuration.max_datagram_size
-        self._network_paths: List[QuicNetworkPath] = []
-        self._pacing_at: Optional[float] = None
-        self._packet_number = 0
-        self._peer_cid = QuicConnectionId(
-            cid=os.urandom(configuration.connection_id_length), sequence_number=None
-        )
-        self._peer_cid_available: List[QuicConnectionId] = []
-        self._peer_cid_sequence_numbers: Set[int] = set([0])
-        self._peer_retire_prior_to = 0
+        self._network_paths: Dict[int, QuicNetworkPath] = {}
         self._peer_token = configuration.token
         self._quic_logger: Optional[QuicLoggerTrace] = None
         self._remote_ack_delay_exponent = 3
@@ -362,7 +380,6 @@ class QuicConnection:
         self._remote_version_information: Optional[QuicVersionInformation] = None
         self._retry_count = 0
         self._retry_source_connection_id = retry_source_connection_id
-        self._spaces: Dict[tls.Epoch, QuicPacketSpace] = {}
         self._spin_bit = False
         self._spin_highest_pn = 0
         self._state = QuicConnectionState.FIRSTFLIGHT
@@ -392,24 +409,11 @@ class QuicConnection:
                 odcid=self._original_destination_connection_id,
             )
 
-        # loss recovery
-        self._loss = QuicPacketRecovery(
-            congestion_control_algorithm=configuration.congestion_control_algorithm,
-            initial_rtt=configuration.initial_rtt,
-            max_datagram_size=self._max_datagram_size,
-            peer_completed_address_validation=not self._is_client,
-            quic_logger=self._quic_logger,
-            send_probe=self._send_probe,
-            logger=self._logger,
-        )
-
         # things to send
         self._close_pending = False
         self._datagrams_pending: Deque[bytes] = deque()
         self._handshake_done_pending = False
         self._ping_pending: List[int] = []
-        self._probe_pending = False
-        self._retire_connection_ids: List[int] = []
         self._streams_blocked_pending = False
 
         # callbacks
@@ -462,19 +466,21 @@ class QuicConnection:
     def original_destination_connection_id(self) -> bytes:
         return self._original_destination_connection_id
 
-    def change_connection_id(self) -> None:
+    def change_connection_id(self, path_id) -> None:
         """
         Switch to the next available connection ID and retire
         the previous one.
 
         .. aioquic_transmit::
+
+        :param path_id: The path_id of the path that should change the connection ID.
         """
-        if self._peer_cid_available:
+        if self._network_paths[path_id].peer_cid_available:
             # retire previous CID
-            self._retire_peer_cid(self._peer_cid)
+            self._retire_peer_cid(path_id, self._network_paths[path_id].peer_cid)
 
             # assign new CID
-            self._consume_peer_cid()
+            self._consume_peer_cid(path_id)
 
     def close(
         self,
@@ -500,7 +506,7 @@ class QuicConnection:
             )
             self._close_pending = True
 
-    def connect(self, addr: NetworkAddress, now: float) -> None:
+    def connect(self, remote_addr: NetworkAddress, local_addr: NetworkAddress, now: float) -> None:
         """
         Initiate the TLS handshake.
 
@@ -516,154 +522,194 @@ class QuicConnection:
         )
         self._connect_called = True
 
-        self._network_paths = [QuicNetworkPath(addr, is_validated=True)]
+        self._network_paths = {0: QuicNetworkPath(
+            path_id=0,
+            host_cid=QuicConnectionId(
+                cid=os.urandom(self._configuration.connection_id_length),
+                sequence_number=0,
+                was_sent=True,
+            ),
+            sequence_number=0,
+            peer_cid=QuicConnectionId(
+                os.urandom(self._configuration.connection_id_length), sequence_number=None
+            ),
+        )}
+        self._network_paths[0].path_tuples = [PathTuple(
+            local_addr=local_addr,
+            remote_addr=remote_addr,
+            is_validated=True,
+        )]
+        self._network_paths[0].active_path_tuple = self._network_paths[0].path_tuples[0]
+        self._network_paths[0].loss = QuicPacketRecovery(
+            congestion_control_algorithm=self._configuration.congestion_control_algorithm,
+            initial_rtt=self._configuration.initial_rtt,
+            max_datagram_size=self._max_datagram_size,
+            peer_completed_address_validation=not self._is_client,
+            quic_logger=self._quic_logger,
+            send_probe=lambda: self._send_probe(0),
+            logger=self._logger,
+        )
         if self._configuration.original_version is not None:
             self._version = self._configuration.original_version
         else:
             self._version = self._configuration.supported_versions[0]
         self._connect(now=now)
 
-    def datagrams_to_send(self, now: float) -> List[Tuple[bytes, NetworkAddress]]:
+    def datagrams_to_send(self, now: float) -> List[Tuple[bytes, NetworkAddress, NetworkAddress]]:
         """
-        Return a list of `(data, addr)` tuples of datagrams which need to be
-        sent, and the network address to which they need to be sent.
+        Return a list of `(data, remote_addr, local_addr)` tuples of datagrams which need to be
+        sent, the network address to which they need to be sent, and the network address 
+        from which they need to be sent.
 
         After calling this method call :meth:`get_timer` to know when the next
         timer needs to be set.
 
         :param now: The current time.
         """
-        network_path = self._network_paths[0]
+        ret = []
 
         if self._state in END_STATES:
             return []
+        
+        # iterate over network paths and 4-tuples
+        for path_id, network_path in self._network_paths.items():
+            for path_tuple in network_path.path_tuples:
+                is_active_path_tuple = path_tuple == network_path.active_path_tuple
 
-        # build datagrams
-        builder = QuicPacketBuilder(
-            host_cid=self.host_cid,
-            is_client=self._is_client,
-            max_datagram_size=self._max_datagram_size,
-            packet_number=self._packet_number,
-            peer_cid=self._peer_cid.cid,
-            peer_token=self._peer_token,
-            quic_logger=self._quic_logger,
-            spin_bit=self._spin_bit,
-            version=self._version,
-        )
-        if self._close_pending:
-            epoch_packet_types = []
-            if not self._handshake_confirmed:
-                epoch_packet_types += [
-                    (tls.Epoch.INITIAL, QuicPacketType.INITIAL),
-                    (tls.Epoch.HANDSHAKE, QuicPacketType.HANDSHAKE),
-                ]
-            epoch_packet_types.append((tls.Epoch.ONE_RTT, QuicPacketType.ONE_RTT))
-            for epoch, packet_type in epoch_packet_types:
-                crypto = self._cryptos[epoch]
-                if crypto.send.is_valid():
-                    builder.start_packet(packet_type, crypto)
-                    self._write_connection_close_frame(
-                        builder=builder,
-                        epoch=epoch,
-                        error_code=self._close_event.error_code,
-                        frame_type=self._close_event.frame_type,
-                        reason_phrase=self._close_event.reason_phrase,
+                # build datagrams
+                builder = QuicPacketBuilder(
+                    host_cid=network_path.host_cid,
+                    is_client=self._is_client,
+                    max_datagram_size=self._max_datagram_size,
+                    packet_number=network_path.packet_number,
+                    peer_cid=network_path.peer_cid.cid,
+                    peer_token=self._peer_token,
+                    quic_logger=self._quic_logger,
+                    spin_bit=self._spin_bit,
+                    version=self._version,
+                )
+                if self._close_pending:
+                    epoch_packet_types = []
+                    if not self._handshake_confirmed:
+                        epoch_packet_types += [
+                            (tls.Epoch.INITIAL, QuicPacketType.INITIAL),
+                            (tls.Epoch.HANDSHAKE, QuicPacketType.HANDSHAKE),
+                        ]
+                    epoch_packet_types.append((tls.Epoch.ONE_RTT, QuicPacketType.ONE_RTT))
+                    for epoch, packet_type in epoch_packet_types:
+                        crypto = self._cryptos[epoch]
+                        if crypto.send.is_valid():
+                            builder.start_packet(packet_type, crypto)
+                            self._write_connection_close_frame(
+                                builder=builder,
+                                epoch=epoch,
+                                error_code=self._close_event.error_code,
+                                frame_type=self._close_event.frame_type,
+                                reason_phrase=self._close_event.reason_phrase,
+                            )
+                    self._logger.info(
+                        "Connection close sent (code 0x%X, reason %s)",
+                        self._close_event.error_code,
+                        self._close_event.reason_phrase,
                     )
-            self._logger.info(
-                "Connection close sent (code 0x%X, reason %s)",
-                self._close_event.error_code,
-                self._close_event.reason_phrase,
-            )
-            self._close_pending = False
-            self._close_begin(is_initiator=True, now=now)
-        else:
-            # congestion control
-            builder.max_flight_bytes = (
-                self._loss.congestion_window - self._loss.bytes_in_flight
-            )
-            if (
-                self._probe_pending
-                and builder.max_flight_bytes < self._max_datagram_size
-            ):
-                builder.max_flight_bytes = self._max_datagram_size
+                    self._close_pending = False
+                    self._close_begin(is_initiator=True, now=now)
+                else:
+                    # limit data on un-validated network paths
+                    if not path_tuple.is_validated and not self._is_client:
+                        builder.max_total_bytes = (
+                            path_tuple.bytes_received * 3 - path_tuple.bytes_sent
+                        )
 
-            # limit data on un-validated network paths
-            if not network_path.is_validated:
-                builder.max_total_bytes = (
-                    network_path.bytes_received * 3 - network_path.bytes_sent
-                )
+                    # congestion control
+                    if is_active_path_tuple:
+                        builder.max_flight_bytes = (
+                            network_path.loss.congestion_window - network_path.loss.bytes_in_flight
+                        )
+                        if (
+                            network_path.probe_pending
+                            and builder.max_flight_bytes < self._max_datagram_size
+                        ):
+                            builder.max_flight_bytes = self._max_datagram_size
+                    else: # apply amplification attack limits
+                        builder.max_flight_bytes = builder.max_total_bytes
+                        if (
+                            network_path.probe_pending
+                            and builder.max_flight_bytes < self._max_datagram_size
+                        ):
+                            builder.max_flight_bytes = self._max_datagram_size
 
-            try:
-                if not self._handshake_confirmed:
-                    for epoch in [tls.Epoch.INITIAL, tls.Epoch.HANDSHAKE]:
-                        self._write_handshake(builder, epoch, now)
-                self._write_application(builder, network_path, now)
-            except QuicPacketBuilderStop:
-                pass
+                    try:
+                        if not self._handshake_confirmed:
+                            for epoch in [tls.Epoch.INITIAL, tls.Epoch.HANDSHAKE]:
+                                self._write_handshake(builder, epoch, now)
+                        self._write_application(builder, network_path, path_tuple, now)
+                    except QuicPacketBuilderStop:
+                        pass
 
-        datagrams, packets = builder.flush()
+                datagrams, packets = builder.flush()
 
-        if datagrams:
-            self._packet_number = builder.packet_number
+                if datagrams:
+                    network_path.packet_number = builder.packet_number
 
-            # register packets
-            sent_handshake = False
-            for packet in packets:
-                packet.sent_time = now
-                self._loss.on_packet_sent(
-                    packet=packet, space=self._spaces[packet.epoch]
-                )
-                if packet.epoch == tls.Epoch.HANDSHAKE:
-                    sent_handshake = True
+                    # register packets
+                    sent_handshake = False
+                    for packet in packets:
+                        packet.sent_time = now
+                        network_path.loss.on_packet_sent(
+                            packet=packet, space=network_path.spaces[packet.epoch]
+                        )
+                        if packet.epoch == tls.Epoch.HANDSHAKE:
+                            sent_handshake = True
 
-                # log packet
-                if self._quic_logger is not None:
-                    self._quic_logger.log_event(
-                        category="transport",
-                        event="packet_sent",
-                        data={
-                            "frames": packet.quic_logger_frames,
-                            "header": {
-                                "packet_number": packet.packet_number,
-                                "packet_type": self._quic_logger.packet_type(
-                                    packet.packet_type
-                                ),
-                                "scid": (
-                                    ""
-                                    if packet.packet_type == QuicPacketType.ONE_RTT
-                                    else dump_cid(self.host_cid)
-                                ),
-                                "dcid": dump_cid(self._peer_cid.cid),
+                        # log packet
+                        if self._quic_logger is not None:
+                            self._quic_logger.log_event(
+                                category="transport",
+                                event="packet_sent",
+                                data={
+                                    "frames": packet.quic_logger_frames,
+                                    "header": {
+                                        "packet_number": packet.packet_number,
+                                        "packet_type": self._quic_logger.packet_type(
+                                            packet.packet_type
+                                        ),
+                                        "scid": (
+                                            ""
+                                            if packet.packet_type == QuicPacketType.ONE_RTT
+                                            else dump_cid(network_path.host_cid)
+                                        ),
+                                        "dcid": dump_cid(network_path.peer_cid.cid),
+                                        "path_id": path_id,
+                                    },
+                                    "raw": {"length": packet.sent_bytes},
+                                },
+                            )
+
+                    # check if we can discard initial keys
+                    if sent_handshake and self._is_client:
+                        self._discard_epoch(tls.Epoch.INITIAL, path_id)
+
+                # return datagrams to send and the destination network address
+                for datagram in datagrams:
+                    payload_length = len(datagram)
+                    path_tuple.bytes_sent += payload_length
+                    ret.append((datagram, path_tuple.remote_addr, path_tuple.local_addr))
+
+                    if self._quic_logger is not None:
+                        self._quic_logger.log_event(
+                            category="transport",
+                            event="datagrams_sent",
+                            data={
+                                "count": 1,
+                                "raw": [
+                                    {
+                                        "length": UDP_HEADER_SIZE + payload_length,
+                                        "payload_length": payload_length,
+                                    }
+                                ],
                             },
-                            "raw": {"length": packet.sent_bytes},
-                        },
-                    )
-
-            # check if we can discard initial keys
-            if sent_handshake and self._is_client:
-                self._discard_epoch(tls.Epoch.INITIAL)
-
-        # return datagrams to send and the destination network address
-        ret = []
-        for datagram in datagrams:
-            payload_length = len(datagram)
-            network_path.bytes_sent += payload_length
-            ret.append((datagram, network_path.addr))
-
-            if self._quic_logger is not None:
-                self._quic_logger.log_event(
-                    category="transport",
-                    event="datagrams_sent",
-                    data={
-                        "count": 1,
-                        "raw": [
-                            {
-                                "length": UDP_HEADER_SIZE + payload_length,
-                                "payload_length": payload_length,
-                            }
-                        ],
-                    },
-                )
+                        )
         return ret
 
     def get_next_available_stream_id(self, is_unidirectional=False) -> int:
@@ -681,19 +727,20 @@ class QuicConnection:
         """
         timer_at = self._close_at
         if self._state not in END_STATES:
-            # ack timer
-            for space in self._loss.spaces:
-                if space.ack_at is not None and space.ack_at < timer_at:
-                    timer_at = space.ack_at
+            for network_path in self._network_paths.values():
+                # ack timer
+                for space in network_path.spaces.values():
+                    if space.ack_at is not None and space.ack_at < timer_at:
+                        timer_at = space.ack_at
 
-            # loss detection timer
-            self._loss_at = self._loss.get_loss_detection_time()
-            if self._loss_at is not None and self._loss_at < timer_at:
-                timer_at = self._loss_at
+                # loss detection timer
+                network_path.loss_at = network_path.loss.get_loss_detection_time()
+                if network_path.loss_at is not None and network_path.loss_at < timer_at:
+                    timer_at = network_path.loss_at
 
-            # pacing timer
-            if self._pacing_at is not None and self._pacing_at < timer_at:
-                timer_at = self._pacing_at
+                # pacing timer
+                if network_path.pacing_at is not None and network_path.pacing_at < timer_at:
+                    timer_at = network_path.pacing_at
 
         return timer_at
 
@@ -717,9 +764,13 @@ class QuicConnection:
             return
 
         # loss detection timeout
-        if self._loss_at is not None and now >= self._loss_at:
-            self._logger.debug("Loss detection triggered")
-            self._loss.on_loss_detection_timeout(now=now)
+        for network_path in self._network_paths.values():
+            if network_path.loss_at is not None and now >= network_path.loss_at:
+                self._logger.debug(
+                    "Loss detection triggered for path %d",
+                    network_path.path_id,
+                )
+                network_path.loss.on_loss_detection_timeout(now=now)
 
     def next_event(self) -> Optional[events.QuicEvent]:
         """
@@ -743,7 +794,14 @@ class QuicConnection:
         # But not too small!
         return max(idle_timeout, 3 * self._loss.get_probe_timeout())
 
-    def receive_datagram(self, data: bytes, addr: NetworkAddress, now: float) -> None:
+    def receive_datagram(
+            self,
+            data: bytes,
+            remote_addr: NetworkAddress,
+            local_addr: NetworkAddress,
+            destination_cid: bytes,
+            now: float,
+        ) -> None:
         """
         Handle an incoming datagram.
 
@@ -785,9 +843,10 @@ class QuicConnection:
         # long-header packets, which is legitimate behaviour.
         #
         # https://datatracker.ietf.org/doc/html/rfc9000#section-8.1
-        network_path = self._find_network_path(addr)
-        if not network_path.is_validated:
-            network_path.bytes_received += payload_length
+        network_path = self._find_network_path(destination_cid)
+        path_tuple = self._find_path_tuple(remote_addr, local_addr, network_path.path_id)
+        if not path_tuple.is_validated:
+            path_tuple.bytes_received += payload_length
 
         # for servers, arm the idle timeout on the first datagram
         if self._close_at is None:
@@ -832,10 +891,11 @@ class QuicConnection:
 
             # Check destination CID matches.
             destination_cid_seq: Optional[int] = None
-            for connection_id in self._host_cids:
-                if header.destination_cid == connection_id.cid:
-                    destination_cid_seq = connection_id.sequence_number
-                    break
+            for np in self._network_paths.values():
+                for connection_id in np.host_cids:
+                    if header.destination_cid == connection_id.cid:
+                        destination_cid_seq = connection_id.sequence_number
+                        break
             if (
                 self._is_client or header.packet_type == QuicPacketType.HANDSHAKE
             ) and destination_cid_seq is None:
@@ -890,7 +950,6 @@ class QuicConnection:
                     "first packet must be INITIAL"
                 )
                 crypto_frame_required = True
-                self._network_paths = [network_path]
                 self._version = header.version
                 self._initialize(header.destination_cid)
 
@@ -901,9 +960,9 @@ class QuicConnection:
             else:
                 crypto = self._cryptos[epoch]
             if epoch == tls.Epoch.ZERO_RTT:
-                space = self._spaces[tls.Epoch.ONE_RTT]
+                space = network_path.spaces[tls.Epoch.ONE_RTT]
             else:
-                space = self._spaces[epoch]
+                space = network_path.spaces[epoch]
 
             # decrypt packet
             encrypted_off = buf.tell() - start_off
@@ -933,7 +992,7 @@ class QuicConnection:
                     and epoch in (tls.Epoch.HANDSHAKE, tls.Epoch.ONE_RTT)
                     and not self._crypto_retransmitted
                 ):
-                    self._loss.reschedule_data(now=now)
+                    network_path.loss.reschedule_data(now=now)
                     self._crypto_retransmitted = True
                 continue
             except CryptoError as exc:
@@ -989,12 +1048,12 @@ class QuicConnection:
 
             # discard initial keys and packet space
             if not self._is_client and epoch == tls.Epoch.HANDSHAKE:
-                self._discard_epoch(tls.Epoch.INITIAL)
+                self._discard_epoch(tls.Epoch.INITIAL, network_path.path_id)
 
             # update state
-            if self._peer_cid.sequence_number is None:
-                self._peer_cid.cid = header.source_cid
-                self._peer_cid.sequence_number = 0
+            if network_path.peer_cid.sequence_number is None:
+                network_path.peer_cid.cid = header.source_cid
+                network_path.peer_cid.sequence_number = 0
 
             if self._state == QuicConnectionState.FIRSTFLIGHT:
                 self._remote_initial_source_connection_id = header.source_cid
@@ -1023,7 +1082,9 @@ class QuicConnection:
             context = QuicReceiveContext(
                 epoch=epoch,
                 host_cid=header.destination_cid,
-                network_path=network_path,
+                local_addr=local_addr,
+                remote_addr=remote_addr,
+                path_id=network_path.path_id,
                 quic_logger_frames=quic_logger_frames,
                 time=now,
                 version=header.version,
@@ -1048,7 +1109,7 @@ class QuicConnection:
             # handle migration
             if (
                 not self._is_client
-                and context.host_cid != self.host_cid
+                and context.host_cid != network_path.host_cid
                 and epoch == tls.Epoch.ONE_RTT
             ):
                 self._logger.debug(
@@ -1056,22 +1117,26 @@ class QuicConnection:
                     dump_cid(context.host_cid),
                     destination_cid_seq,
                 )
-                self.host_cid = context.host_cid
+                network_path.host_cid = context.host_cid
                 self.change_connection_id()
 
             # update network path
-            if not network_path.is_validated and epoch == tls.Epoch.HANDSHAKE:
+            if not path_tuple.is_validated and epoch == tls.Epoch.HANDSHAKE:
                 self._logger.debug(
-                    "Network path %s validated by handshake", network_path.addr
+                    "Network path %s, %s validated by handshake", 
+                    path_tuple.remote_addr, 
+                    path_tuple.local_addr,
                 )
-                network_path.is_validated = True
-            if network_path not in self._network_paths:
-                self._network_paths.append(network_path)
-            idx = self._network_paths.index(network_path)
+                path_tuple.is_validated = True
+            idx = network_path.path_tuples.index(path_tuple)
             if idx and not is_probing and packet_number > space.largest_received_packet:
-                self._logger.debug("Network path %s promoted", network_path.addr)
-                self._network_paths.pop(idx)
-                self._network_paths.insert(0, network_path)
+                self._logger.debug(
+                    "Network path %s, %s promoted", 
+                    path_tuple.remote_addr,
+                    path_tuple.local_addr,
+                )
+                network_path.path_tuples.pop(idx)
+                network_path.path_tuples.insert(0, path_tuple)
 
             # record packet as received
             if not space.discarded:
@@ -1238,17 +1303,18 @@ class QuicConnection:
                 reason_phrase="Stream is receive-only",
             )
 
-    def _consume_peer_cid(self) -> None:
+    def _consume_peer_cid(self, path_id: int) -> None:
         """
         Update the destination connection ID by taking the next
         available connection ID provided by the peer.
         """
 
-        self._peer_cid = self._peer_cid_available.pop(0)
+        self._network_paths[path_id].peer_cid = self._network_paths[path_id].peer_cid_available.pop(0)
         self._logger.debug(
-            "Switching to CID %s (%d)",
-            dump_cid(self._peer_cid.cid),
-            self._peer_cid.sequence_number,
+            "Switching to CID %s (%d) for path %d",
+            dump_cid(self._network_paths[path_id].peer_cid.cid),
+            self._network_paths[path_id].peer_cid.sequence_number,
+            path_id,
         )
 
     def _close_begin(self, is_initiator: bool, now: float) -> None:
@@ -1298,13 +1364,14 @@ class QuicConnection:
             )
 
         self._close_at = now + self._idle_timeout()
-        self._initialize(self._peer_cid.cid)
+        self._initialize(self._network_paths[0].peer_cid.cid)
 
         self.tls.handle_message(b"", self._crypto_buffers)
         self._push_crypto_data()
 
-    def _discard_epoch(self, epoch: tls.Epoch) -> None:
-        if not self._spaces[epoch].discarded:
+    def _discard_epoch(self, epoch: tls.Epoch, path_id: int) -> None:
+        network_path = self._network_paths[path_id]
+        if not network_path.spaces[epoch].discarded:
             self._logger.debug("Discarding epoch %s", epoch)
             self._cryptos[epoch].teardown()
             if epoch == tls.Epoch.INITIAL:
@@ -1314,19 +1381,57 @@ class QuicConnection:
                     crypto.recv._teardown_cb = NoCallback
                     crypto.send._teardown_cb = NoCallback
                     crypto.teardown()
-            self._loss.discard_space(self._spaces[epoch])
-            self._spaces[epoch].discarded = True
+            network_path.loss.discard_space(network_path.spaces[epoch])
+            network_path.spaces[epoch].discarded = True
 
-    def _find_network_path(self, addr: NetworkAddress) -> QuicNetworkPath:
+    def _find_network_path(self, destination_cid: bytes) -> QuicNetworkPath:
         # check existing network paths
         for idx, network_path in enumerate(self._network_paths):
-            if network_path.addr == addr:
-                return network_path
+            for host_cid in network_path.host_cids:
+                if host_cid.cid == destination_cid:
+                    return network_path
+        
+        if not self._is_client and len(self._network_paths) == 0:
+            network_path = QuicNetworkPath(
+                path_id=0,
+                host_cid=QuicConnectionId(
+                    cid=os.urandom(self._configuration.connection_id_length),
+                    sequence_number=0,
+                    was_sent=True,
+                ),
+                sequence_number=0,
+                peer_cid=QuicConnectionId(
+                    os.urandom(self._configuration.connection_id_length), sequence_number=None
+                ),
+            )
+            self._network_paths = {0: network_path}
+            return network_path
 
-        # new network path
-        network_path = QuicNetworkPath(addr)
-        self._logger.debug("Network path %s discovered", network_path.addr)
-        return network_path
+        # todo: Further cases of 'destination CID cannot be matched'
+    
+    def _find_path_tuple(
+            self, 
+            remote_addr: NetworkAddress, 
+            local_addr: NetworkAddress,
+            path_id: int,
+        ) -> PathTuple:
+        # check exising path tuples
+        for path_tuple in self._network_paths[path_id]:
+            if (
+                path_tuple.remote_addr == remote_addr and 
+                path_tuple.local_addr == local_addr
+            ):
+                return path_tuple
+
+        # new path tuple
+        path_tuple = PathTuple(
+            local_addr=local_addr,
+            remote_addr=remote_addr,
+            is_validated=False,
+        )
+        self._network_paths[path_id].path_tuples.append(path_tuple)
+        self._logger.debug("4-tuple %s, %s discovered", remote_addr, local_addr)
+        return path_tuple
 
     def _get_or_create_stream(self, frame_type: int, stream_id: int) -> QuicStream:
         """
@@ -1534,12 +1639,12 @@ class QuicConnection:
             tls.Epoch.HANDSHAKE: QuicStream(),
             tls.Epoch.ONE_RTT: QuicStream(),
         }
-        self._spaces = {
+        self._network_paths[0].spaces = {
             tls.Epoch.INITIAL: QuicPacketSpace(),
             tls.Epoch.HANDSHAKE: QuicPacketSpace(),
             tls.Epoch.ONE_RTT: QuicPacketSpace(),
         }
-        self._loss.spaces = list(self._spaces.values())
+        self._network_paths[0].loss.spaces = list(self._network_paths[0].spaces.values())
 
     def _handle_ack_frame(
         self, context: QuicReceiveContext, frame_type: int, buf: Buffer
@@ -1547,6 +1652,7 @@ class QuicConnection:
         """
         Handle an ACK frame.
         """
+        network_path = self._network_paths[context.path_id]
         ack_rangeset, ack_delay_encoded = pull_ack_frame(buf)
         if frame_type == QuicFrameType.ACK_ECN:
             buf.pull_uint_var()
@@ -1561,17 +1667,17 @@ class QuicConnection:
             )
 
         # check whether peer completed address validation
-        if not self._loss.peer_completed_address_validation and context.epoch in (
+        if not network_path.loss.peer_completed_address_validation and context.epoch in (
             tls.Epoch.HANDSHAKE,
             tls.Epoch.ONE_RTT,
         ):
-            self._loss.peer_completed_address_validation = True
+            network_path.loss.peer_completed_address_validation = True
 
-        self._loss.on_ack_received(
+        network_path.loss.on_ack_received(
             ack_rangeset=ack_rangeset,
             ack_delay=ack_delay,
             now=context.time,
-            space=self._spaces[context.epoch],
+            space=network_path.spaces[context.epoch],
         )
 
     def _handle_connection_close_frame(
@@ -1670,7 +1776,7 @@ class QuicConnection:
 
                 # for servers, the handshake is now confirmed
                 if not self._is_client:
-                    self._discard_epoch(tls.Epoch.HANDSHAKE)
+                    self._discard_epoch(tls.Epoch.HANDSHAKE, context.path_id)
                     self._handshake_confirmed = True
                     self._handshake_done_pending = True
 
@@ -1699,7 +1805,7 @@ class QuicConnection:
                 and context.epoch == tls.Epoch.INITIAL
                 and not self._crypto_retransmitted
             ):
-                self._loss.reschedule_data(now=context.time)
+                self._network_paths[context.path_id].loss.reschedule_data(now=context.time)
                 self._crypto_retransmitted = True
 
     def _handle_data_blocked_frame(
@@ -1769,9 +1875,9 @@ class QuicConnection:
 
         # for clients, the handshake is now confirmed
         if not self._handshake_confirmed:
-            self._discard_epoch(tls.Epoch.HANDSHAKE)
+            self._discard_epoch(tls.Epoch.HANDSHAKE, context.path_id)
             self._handshake_confirmed = True
-            self._loss.peer_completed_address_validation = True
+            self._network_paths[context.path_id].loss.peer_completed_address_validation = True
 
     def _handle_max_data_frame(
         self, context: QuicReceiveContext, frame_type: int, buf: Buffer
@@ -1890,6 +1996,7 @@ class QuicConnection:
         """
         Handle a NEW_CONNECTION_ID frame.
         """
+        network_path = self._network_paths[context.path_id]
         sequence_number = buf.pull_uint_var()
         retire_prior_to = buf.pull_uint_var()
         length = buf.pull_uint8()
@@ -1922,48 +2029,48 @@ class QuicConnection:
             )
 
         # only accept retire_prior_to if it is bigger than the one we know
-        self._peer_retire_prior_to = max(retire_prior_to, self._peer_retire_prior_to)
+        network_path.peer_retire_prior_to = max(retire_prior_to, network_path.peer_retire_prior_to)
 
         # determine which CIDs to retire
         change_cid = False
         retire = [
             cid
-            for cid in self._peer_cid_available
-            if cid.sequence_number < self._peer_retire_prior_to
+            for cid in network_path.peer_cid_available
+            if cid.sequence_number < network_path.peer_retire_prior_to
         ]
-        if self._peer_cid.sequence_number < self._peer_retire_prior_to:
+        if network_path.peer_cid.sequence_number < network_path.peer_retire_prior_to:
             change_cid = True
-            retire.insert(0, self._peer_cid)
+            retire.insert(0, network_path.peer_cid)
 
         # update available CIDs
-        self._peer_cid_available = [
+        network_path.peer_cid_available = [
             cid
-            for cid in self._peer_cid_available
-            if cid.sequence_number >= self._peer_retire_prior_to
+            for cid in network_path.peer_cid_available
+            if cid.sequence_number >= network_path.peer_retire_prior_to
         ]
         if (
-            sequence_number >= self._peer_retire_prior_to
-            and sequence_number not in self._peer_cid_sequence_numbers
+            sequence_number >= network_path.peer_retire_prior_to
+            and sequence_number not in network_path.peer_cid_sequence_numbers
         ):
-            self._peer_cid_available.append(
+            network_path.peer_cid_available.append(
                 QuicConnectionId(
                     cid=connection_id,
                     sequence_number=sequence_number,
                     stateless_reset_token=stateless_reset_token,
                 )
             )
-            self._peer_cid_sequence_numbers.add(sequence_number)
+            network_path.peer_cid_sequence_numbers.add(sequence_number)
 
         # retire previous CIDs
         for quic_connection_id in retire:
-            self._retire_peer_cid(quic_connection_id)
+            self._retire_peer_cid(context.path_id, quic_connection_id)
 
         # assign new CID if we retired the active one
         if change_cid:
-            self._consume_peer_cid()
+            self._consume_peer_cid(context.path_id)
 
         # check number of active connection IDs, including the selected one
-        if 1 + len(self._peer_cid_available) > self._local_active_connection_id_limit:
+        if 1 + len(network_path.peer_cid_available) > self._local_active_connection_id_limit:
             raise QuicConnectionError(
                 error_code=QuicErrorCode.CONNECTION_ID_LIMIT_ERROR,
                 frame_type=frame_type,
@@ -1976,7 +2083,7 @@ class QuicConnection:
         # use here, and because it is the new connection id path that is potentially
         # dangerous.  We may transiently go a bit over the limit due to unacked frames
         # getting added back to the list, but that's ok as it is bounded.
-        if len(self._retire_connection_ids) > min(
+        if len(network_path.retire_connection_ids) > min(
             self._local_active_connection_id_limit * 4, MAX_PENDING_RETIRES
         ):
             raise QuicConnectionError(
@@ -2042,7 +2149,7 @@ class QuicConnection:
                 self._quic_logger.encode_path_challenge_frame(data=data)
             )
 
-        context.network_path.remote_challenges.append(data)
+        self._network_paths[context.path_id].active_path_tuple.remote_challenges.append(data)
 
     def _handle_path_response_frame(
         self, context: QuicReceiveContext, frame_type: int, buf: Buffer
@@ -2058,16 +2165,24 @@ class QuicConnection:
                 self._quic_logger.encode_path_response_frame(data=data)
             )
 
-        try:
-            network_path = self._local_challenges.pop(data)
-        except KeyError:
+        validated_path_tuple = None
+        for path_tuple in self._network_paths[context.path_id].path_tuples:
+            if data in path_tuple.local_challenges:
+                validated_path_tuple = path_tuple
+                break
+        if validated_path_tuple is None:
             raise QuicConnectionError(
                 error_code=QuicErrorCode.PROTOCOL_VIOLATION,
                 frame_type=frame_type,
                 reason_phrase="Response does not match challenge",
             )
-        self._logger.debug("Network path %s validated by challenge", network_path.addr)
-        network_path.is_validated = True
+                
+        self._logger.debug(
+            "Network path %s validated by challenge", 
+            validated_path_tuple.remote_addr, 
+            validated_path_tuple.local_addr,
+        )
+        validated_path_tuple.is_validated = True
 
     def _handle_ping_frame(
         self, context: QuicReceiveContext, frame_type: int, buf: Buffer
@@ -2143,6 +2258,7 @@ class QuicConnection:
         """
         Handle a RETIRE_CONNECTION_ID frame.
         """
+        network_path = self._network_paths[context.path_id]
         sequence_number = buf.pull_uint_var()
 
         # log frame
@@ -2151,7 +2267,7 @@ class QuicConnection:
                 self._quic_logger.encode_retire_connection_id_frame(sequence_number)
             )
 
-        if sequence_number >= self._host_cid_seq:
+        if sequence_number >= network_path.host_cid_seq:
             raise QuicConnectionError(
                 error_code=QuicErrorCode.PROTOCOL_VIOLATION,
                 frame_type=frame_type,
@@ -2159,7 +2275,7 @@ class QuicConnection:
             )
 
         # find the connection ID by sequence number
-        for index, connection_id in enumerate(self._host_cids):
+        for index, connection_id in enumerate(network_path.host_cids):
             if connection_id.sequence_number == sequence_number:
                 if connection_id.cid == context.host_cid:
                     raise QuicConnectionError(
@@ -2172,14 +2288,14 @@ class QuicConnection:
                     dump_cid(connection_id.cid),
                     connection_id.sequence_number,
                 )
-                del self._host_cids[index]
+                del network_path.host_cids[index]
                 self._events.append(
                     events.ConnectionIdRetired(connection_id=connection_id.cid)
                 )
                 break
 
         # issue a new connection ID
-        self._replenish_connection_ids()
+        self._replenish_connection_ids(context.path_id)
 
     def _handle_stop_sending_frame(
         self, context: QuicReceiveContext, frame_type: int, buf: Buffer
@@ -2396,13 +2512,13 @@ class QuicConnection:
             self._ping_pending.extend(uids)
 
     def _on_retire_connection_id_delivery(
-        self, delivery: QuicDeliveryState, sequence_number: int
+        self, delivery: QuicDeliveryState, sequence_number: int, path_id: int
     ) -> None:
         """
         Callback when a RETIRE_CONNECTION_ID frame is acknowledged or lost.
         """
         if delivery != QuicDeliveryState.ACKED:
-            self._retire_connection_ids.append(sequence_number)
+            self._network_paths[path_id].retire_connection_ids.append(sequence_number)
 
     def _payload_received(
         self,
@@ -2525,7 +2641,7 @@ class QuicConnection:
                     },
                 )
 
-            self._peer_cid.cid = header.source_cid
+            self._network_paths[0].peer_cid.cid = header.source_cid
             self._peer_token = header.token
             self._retry_count += 1
             self._retry_source_connection_id = header.source_cid
@@ -2638,39 +2754,41 @@ class QuicConnection:
                     },
                 )
 
-    def _replenish_connection_ids(self) -> None:
+    def _replenish_connection_ids(self, path_id: int) -> None:
         """
         Generate new connection IDs.
         """
-        while len(self._host_cids) < min(8, self._remote_active_connection_id_limit):
-            self._host_cids.append(
+        network_path = self._network_paths[path_id]
+        while len(network_path.host_cids) < min(8, self._remote_active_connection_id_limit):
+            network_path.host_cids.append(
                 QuicConnectionId(
                     cid=os.urandom(self._configuration.connection_id_length),
-                    sequence_number=self._host_cid_seq,
+                    sequence_number=network_path.host_cid_seq,
                     stateless_reset_token=os.urandom(16),
                 )
             )
-            self._host_cid_seq += 1
+            network_path.host_cid_seq += 1
 
-    def _retire_peer_cid(self, connection_id: QuicConnectionId) -> None:
+    def _retire_peer_cid(self, path_id: int, connection_id: QuicConnectionId) -> None:
         """
         Retire a destination connection ID.
         """
         self._logger.debug(
-            "Retiring CID %s (%d) [%d]",
+            "Retiring CID %s (%d) [%d] for path %d",
             dump_cid(connection_id.cid),
             connection_id.sequence_number,
-            len(self._retire_connection_ids) + 1,
+            len(self._network_paths[path_id].retire_connection_ids) + 1,
+            path_id,
         )
-        self._retire_connection_ids.append(connection_id.sequence_number)
+        self._network_paths[path_id].retire_connection_ids.append(connection_id.sequence_number)
 
     def _push_crypto_data(self) -> None:
         for epoch, buf in self._crypto_buffers.items():
             self._crypto_streams[epoch].sender.write(buf.data)
             buf.seek(0)
 
-    def _send_probe(self) -> None:
-        self._probe_pending = True
+    def _send_probe(self, path_id: int) -> None:
+        self._network_paths[path_id].probe_pending = True
 
     def _parse_transport_parameters(
         self, data: bytes, from_session_ticket: bool = False
@@ -2864,6 +2982,7 @@ class QuicConnection:
                 setattr(self, "_remote_" + param, value)
 
     def _serialize_transport_parameters(self) -> bytes:
+        self._local_initial_source_connection_id = self._network_paths[0].host_cid
         quic_transport_parameters = QuicTransportParameters(
             ack_delay_exponent=self._local_ack_delay_exponent,
             active_connection_id_limit=self._local_active_connection_id_limit,
@@ -2984,16 +3103,20 @@ class QuicConnection:
                 cipher_suite=cipher_suite, secret=secret, version=self._version
             )
 
-    def _add_local_challenge(self, challenge: bytes, network_path: QuicNetworkPath):
-        self._local_challenges[challenge] = network_path
-        while len(self._local_challenges) > MAX_LOCAL_CHALLENGES:
+    def _add_local_challenge(self, challenge: bytes, path_tuple: PathTuple):
+        path_tuple.local_challenges.append(challenge)
+        while len(path_tuple.local_challenges) > MAX_LOCAL_CHALLENGES:
             # Dictionaries are ordered, so pop the first key until we are below the
             # limit.
-            key = next(iter(self._local_challenges.keys()))
-            del self._local_challenges[key]
+            key = next(iter(path_tuple.local_challenges))
+            path_tuple.local_challenges.remove(key)
 
     def _write_application(
-        self, builder: QuicPacketBuilder, network_path: QuicNetworkPath, now: float
+        self,
+        builder: QuicPacketBuilder,
+        network_path: QuicNetworkPath,
+        path_tuple: PathTuple,
+        now: float,
     ) -> None:
         crypto_stream: Optional[QuicStream] = None
         if self._cryptos[tls.Epoch.ONE_RTT].send.is_valid():
@@ -3005,13 +3128,13 @@ class QuicConnection:
             packet_type = QuicPacketType.ZERO_RTT
         else:
             return
-        space = self._spaces[tls.Epoch.ONE_RTT]
+        space = network_path.spaces[tls.Epoch.ONE_RTT]
 
         while True:
             # apply pacing, except if we have ACKs to send
             if space.ack_at is None or space.ack_at >= now:
-                self._pacing_at = self._loss._pacer.next_send_time(now=now)
-                if self._pacing_at is not None:
+                network_path.pacing_at = network_path.loss._pacer.next_send_time(now=now)
+                if network_path.pacing_at is not None:
                     break
             builder.start_packet(packet_type, crypto)
 
@@ -3026,36 +3149,36 @@ class QuicConnection:
                     self._handshake_done_pending = False
 
                 # PATH CHALLENGE
-                if not (network_path.is_validated or network_path.local_challenge_sent):
+                if not (path_tuple.is_validated or path_tuple.local_challenge_sent):
                     challenge = os.urandom(8)
                     self._add_local_challenge(
-                        challenge=challenge, network_path=network_path
+                        challenge=challenge, path_tuple=path_tuple
                     )
                     self._write_path_challenge_frame(
                         builder=builder, challenge=challenge
                     )
-                    network_path.local_challenge_sent = True
+                    path_tuple.local_challenge_sent = True
 
                 # PATH RESPONSE
-                while len(network_path.remote_challenges) > 0:
-                    challenge = network_path.remote_challenges.popleft()
+                while len(path_tuple.remote_challenges) > 0:
+                    challenge = path_tuple.remote_challenges.popleft()
                     self._write_path_response_frame(
                         builder=builder, challenge=challenge
                     )
 
                 # NEW_CONNECTION_ID
-                for connection_id in self._host_cids:
+                for connection_id in network_path.host_cids:
                     if not connection_id.was_sent:
                         self._write_new_connection_id_frame(
                             builder=builder, connection_id=connection_id
                         )
 
                 # RETIRE_CONNECTION_ID
-                for sequence_number in self._retire_connection_ids[:]:
+                for sequence_number in network_path.retire_connection_ids[:]:
                     self._write_retire_connection_id_frame(
                         builder=builder, sequence_number=sequence_number
                     )
-                    self._retire_connection_ids.pop(0)
+                    network_path.retire_connection_ids.pop(0)
 
                 # STREAMS_BLOCKED
                 if self._streams_blocked_pending:
@@ -3086,9 +3209,9 @@ class QuicConnection:
                 self._ping_pending.clear()
 
             # PING (probe)
-            if self._probe_pending:
+            if network_path.probe_pending:
                 self._write_ping_frame(builder, comment="probe")
-                self._probe_pending = False
+                network_path.probe_pending = False
 
             # CRYPTO
             if crypto_stream is not None and not crypto_stream.sender.buffer_is_empty:
@@ -3160,7 +3283,7 @@ class QuicConnection:
             if builder.packet_is_empty:
                 break
             else:
-                self._loss._pacer.update_after_send(now=now)
+                network_path.loss._pacer.update_after_send(now=now)
 
     def _write_handshake(
         self, builder: QuicPacketBuilder, epoch: tls.Epoch, now: float
@@ -3170,7 +3293,7 @@ class QuicConnection:
             return
 
         crypto_stream = self._crypto_streams[epoch]
-        space = self._spaces[epoch]
+        space = self._network_paths[0].spaces[epoch]
 
         while True:
             if epoch == tls.Epoch.INITIAL:
@@ -3188,11 +3311,11 @@ class QuicConnection:
                 if self._write_crypto_frame(
                     builder=builder, space=space, stream=crypto_stream
                 ):
-                    self._probe_pending = False
+                    self._network_paths[0].probe_pending = False
 
             # PING (probe)
             if (
-                self._probe_pending
+                self._network_paths[0].probe_pending
                 and not self._handshake_complete
                 and (
                     epoch == tls.Epoch.HANDSHAKE
@@ -3200,7 +3323,7 @@ class QuicConnection:
                 )
             ):
                 self._write_ping_frame(builder, comment="probe")
-                self._probe_pending = False
+                self._network_paths[0].probe_pending = False
 
             if builder.packet_is_empty:
                 break
