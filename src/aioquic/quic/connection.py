@@ -393,7 +393,7 @@ class QuicConnection:
         self._version_negotiated_incompatible = False
 
         if self._is_client:
-            self._original_destination_connection_id = self._peer_cid.cid
+            self._original_destination_connection_id = os.urandom(self._configuration.connection_id_length)
         else:
             self._original_destination_connection_id = (
                 original_destination_connection_id
@@ -531,7 +531,7 @@ class QuicConnection:
             ),
             sequence_number=0,
             peer_cid=QuicConnectionId(
-                os.urandom(self._configuration.connection_id_length), sequence_number=None
+                self._original_destination_connection_id, sequence_number=None
             ),
         )}
         self._network_paths[0].path_tuples = [PathTuple(
@@ -794,14 +794,7 @@ class QuicConnection:
         # But not too small!
         return max(idle_timeout, 3 * self._loss.get_probe_timeout())
 
-    def receive_datagram(
-            self,
-            data: bytes,
-            remote_addr: NetworkAddress,
-            local_addr: NetworkAddress,
-            destination_cid: bytes,
-            now: float,
-        ) -> None:
+    def receive_datagram(self, data: bytes, addr: NetworkAddress, now: float) -> None:
         """
         Handle an incoming datagram.
 
@@ -811,6 +804,9 @@ class QuicConnection:
         :param addr: The network address from which the datagram was received.
         :param now: The current time.
         """
+        remote_addr = addr # tmp fix for testing
+        local_addr = ("::ffff:127.0.0.1", 1234, 0, 0) # tmp dummy addr
+        destination_cid = os.urandom(self._configuration.connection_id_length) # tmp dummy cid
         payload_length = len(data)
 
         # stop handling packets when closing
@@ -1385,6 +1381,7 @@ class QuicConnection:
             network_path.spaces[epoch].discarded = True
 
     def _find_network_path(self, destination_cid: bytes) -> QuicNetworkPath:
+        return self._network_paths[0] # tmp fixed to path 0
         # check existing network paths
         for idx, network_path in enumerate(self._network_paths):
             for host_cid in network_path.host_cids:
@@ -2618,7 +2615,7 @@ class QuicConnection:
         if (
             self._is_client
             and not self._retry_count
-            and header.destination_cid == self.host_cid
+            and header.destination_cid == self._network_paths[0].host_cid
             and header.integrity_tag
             == get_retry_integrity_tag(
                 packet_without_tag,
