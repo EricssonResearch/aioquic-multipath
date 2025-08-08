@@ -425,7 +425,7 @@ async def main(
 
             # process http pushes
             process_http_pushes(client=client, include=include, output_dir=output_dir)
-        client.close(error_code=ErrorCode.H3_NO_ERROR)
+        client.close()
 
 
 if __name__ == "__main__":
