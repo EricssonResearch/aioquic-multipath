@@ -1,5 +1,5 @@
 import asyncio
-from typing import Any, Callable, Dict, Optional, Text, Tuple, Union, cast
+from typing import Any, Callable, Dict, Optional, Text, Tuple, Union, cast, List
 
 from ..quic import events
 from ..quic.connection import NetworkAddress, QuicConnection
@@ -7,6 +7,47 @@ from ..quic.packet import QuicErrorCode
 
 QuicConnectionIdHandler = Callable[[bytes], None]
 QuicStreamHandler = Callable[[asyncio.StreamReader, asyncio.StreamWriter], None]
+
+class ProtocolWrapper(asyncio.DatagramProtocol):
+    def __init__(
+        self, callback_function: Callable
+    ):
+        self._datagram_callback : Callable = callback_function
+        super().__init__()
+
+    def datagram_received(self, data: Union[bytes, Text], addr: NetworkAddress) -> None:
+        self._datagram_callback(data, addr)
+
+class TransportWrapper(asyncio.DatagramTransport):
+    def __init__(
+        self, local_addr: NetworkAddress, addr: NetworkAddress = None, transport: Optional[asyncio.DatagramTransport] = None
+    ):
+        self.addr = [addr]
+        self.local_addr = local_addr
+        self._transport = transport
+    
+    async def create_transport(self, loop, parent_protocol) -> Tuple[asyncio.DatagramTransport, asyncio.DatagramProtocol]:
+        transport, _ = await loop.create_datagram_endpoint(lambda : ProtocolWrapper(self.datagram_received), self.local_addr)
+        self.local_addr = transport.get_extra_info('sockname')[0:2]
+        self._transport = transport
+        self._parent_protocol = parent_protocol # QuicConnectionProtocol for client; QuicServer for server
+        print(f"transport created with local addr {self.local_addr}")
+        return self, self._parent_protocol
+    
+    def sendto(self, data: bytes, addr: NetworkAddress) -> None:
+        self._transport.sendto(data, addr)
+        
+    def datagram_received(self, data: bytes, addr: NetworkAddress) -> None:
+        if self.addr == [None]:
+            self.addr = [addr]
+        if addr not in self.addr:
+            self.addr.append(addr)
+        self._parent_protocol.datagram_received(data, addr, self.local_addr)
+
+    def remove_addr(self, addr_remove: NetworkAddress) -> None:
+        for count, addr in enumerate(self.addr):
+            if addr == addr_remove:
+                del self.addr[count]
 
 
 class QuicConnectionProtocol(asyncio.DatagramProtocol):
@@ -25,7 +66,7 @@ class QuicConnectionProtocol(asyncio.DatagramProtocol):
         self._timer: Optional[asyncio.TimerHandle] = None
         self._timer_at: Optional[float] = None
         self._transmit_task: Optional[asyncio.Handle] = None
-        self._transport: Optional[asyncio.DatagramTransport] = None
+        self._transports:  List[TransportWrapper] = []
 
         # callbacks
         self._connection_id_issued_handler: QuicConnectionIdHandler = lambda c: None
@@ -64,13 +105,16 @@ class QuicConnectionProtocol(asyncio.DatagramProtocol):
         )
         self.transmit()
 
-    def connect(self, addr: NetworkAddress, transmit=True) -> None:
+    async def connect(self, addr: NetworkAddress, local_addr: NetworkAddress, transmit=True) -> None:
         """
         Initiate the TLS handshake.
 
         This method can only be called for clients and a single time.
         """
-        self._quic.connect(addr, now=self._loop.time())
+        transport = TransportWrapper(local_addr, addr)
+        _transport, _protocol = await transport.create_transport(self._loop, self)
+        self._transports.append(_transport)
+        self._quic.connect(addr, _transport.local_addr, now=self._loop.time())
         if transmit:
             self.transmit()
 
@@ -118,8 +162,12 @@ class QuicConnectionProtocol(asyncio.DatagramProtocol):
         self._transmit_task = None
 
         # send datagrams
-        for data, addr in self._quic.datagrams_to_send(now=self._loop.time()):
-            self._transport.sendto(data, addr)
+        #for data, addr in self._quic.datagrams_to_send(now=self._loop.time()):
+        #    self._transport.sendto(data, addr)
+        for data, addr, local_addr in self._quic.datagrams_to_send(now=self._loop.time()):
+            _, transportno = self._find_transport(addr, local_addr)
+            self._transports[transportno].sendto(data, addr)
+
 
         # re-arm timer
         timer_at = self._quic.get_timer()
@@ -147,13 +195,23 @@ class QuicConnectionProtocol(asyncio.DatagramProtocol):
 
     # asyncio.Transport
 
-    def connection_made(self, transport: asyncio.BaseTransport) -> None:
+    #def connection_made(self, transport: asyncio.BaseTransport) -> None:
+    #    """:meta private:"""
+    #    self._transport = cast(asyncio.DatagramTransport, transport)
+    #def connection_made(self, transport: asyncio.BaseTransport) -> None:
+    #    """:meta private:"""
+    #    self._transports.append(cast(asyncio.DatagramTransport, transport))
+    def connection_made(self, transports: List[asyncio.BaseTransport]) -> None:
         """:meta private:"""
-        self._transport = cast(asyncio.DatagramTransport, transport)
-
-    def datagram_received(self, data: Union[bytes, Text], addr: NetworkAddress) -> None:
+        self._transports += transports
+    #def connection_made(self, transport: asyncio.BaseTransport) -> None:
+    #    local_addr = transport.get_extra_info('sockname')[0:2]
+    #    _transport = TransportWrapper(local_addr=local_addr, transport=transport)
+    #    self._transports.append(_transport)
+        
+    def datagram_received(self, data: Union[bytes, Text], addr: NetworkAddress, local_addr: NetworkAddress) -> None:
         """:meta private:"""
-        self._quic.receive_datagram(cast(bytes, data), addr, now=self._loop.time())
+        self._quic.receive_datagram(cast(bytes, data), addr, addr_local=local_addr, now=self._loop.time())
         self._process_events()
         self.transmit()
 
@@ -189,6 +247,15 @@ class QuicConnectionProtocol(asyncio.DatagramProtocol):
         writer = asyncio.StreamWriter(adapter, protocol, reader, self._loop)
         self._stream_readers[stream_id] = reader
         return reader, writer
+    
+    def _find_transport(self, addr: NetworkAddress, local_addr: NetworkAddress) -> Tuple[TransportWrapper, int]:
+        # check existing network paths
+        for idx, transport in enumerate(self._transports):
+            if addr in transport.addr:
+                if transport.local_addr == local_addr:
+                    return transport, idx
+        raise ValueError(
+            "Transport for addr %s and local addr %s not available" % (str(addr), str(local_addr)))
 
     def _handle_timer(self) -> None:
         now = max(self._timer_at, self._loop.time())

@@ -14,7 +14,7 @@ from ..quic.packet import (
 )
 from ..quic.retry import QuicRetryTokenHandler
 from ..tls import SessionTicketFetcher, SessionTicketHandler
-from .protocol import QuicConnectionProtocol, QuicStreamHandler
+from .protocol import QuicConnectionProtocol, TransportWrapper, QuicStreamHandler
 
 __all__ = ["serve"]
 
@@ -36,7 +36,8 @@ class QuicServer(asyncio.DatagramProtocol):
         self._protocols: Dict[bytes, QuicConnectionProtocol] = {}
         self._session_ticket_fetcher = session_ticket_fetcher
         self._session_ticket_handler = session_ticket_handler
-        self._transport: Optional[asyncio.DatagramTransport] = None
+        #self._transport: Optional[asyncio.DatagramTransport] = None
+        self._transports: List[TransportWrapper] = []
 
         self._stream_handler = stream_handler
 
@@ -52,12 +53,20 @@ class QuicServer(asyncio.DatagramProtocol):
         for protocol in set(self._protocols.values()):
             protocol.close()
         self._protocols.clear()
-        self._transport.close()
+        #self._transport.close()
+        for transport in self._transports:
+           transport._transport.close()
+        self._transports.clear()
 
+    #def connection_made(self, transport: asyncio.BaseTransport) -> None:
+    #    self._transport = cast(asyncio.DatagramTransport, transport)
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
-        self._transport = cast(asyncio.DatagramTransport, transport)
+        local_addr = transport.get_extra_info('sockname')[0:2]
+        _transport = TransportWrapper(local_addr=local_addr, transport=transport)
+        self._transports.append(_transport)
 
-    def datagram_received(self, data: Union[bytes, Text], addr: NetworkAddress) -> None:
+    def datagram_received(self, data: Union[bytes, Text], addr: NetworkAddress, local_addr: NetworkAddress) -> None:
+        transport_no = self._find_transport_no(local_addr)
         data = cast(bytes, data)
         buf = Buffer(data=data)
 
@@ -73,7 +82,7 @@ class QuicServer(asyncio.DatagramProtocol):
             header.version is not None
             and header.version not in self._configuration.supported_versions
         ):
-            self._transport.sendto(
+            self._transports[transport_no].sendto(
                 encode_quic_version_negotiation(
                     source_cid=header.destination_cid,
                     destination_cid=header.source_cid,
@@ -96,7 +105,7 @@ class QuicServer(asyncio.DatagramProtocol):
                 if not header.token:
                     # create a retry token
                     source_cid = os.urandom(8)
-                    self._transport.sendto(
+                    self._transports[transport_no].sendto(
                         encode_quic_retry(
                             version=header.version,
                             source_cid=source_cid,
@@ -132,7 +141,7 @@ class QuicServer(asyncio.DatagramProtocol):
             protocol = self._create_protocol(
                 connection, stream_handler=self._stream_handler
             )
-            protocol.connection_made(self._transport)
+            protocol.connection_made(self._transports)
 
             # register callbacks
             protocol._connection_id_issued_handler = partial(
@@ -146,10 +155,20 @@ class QuicServer(asyncio.DatagramProtocol):
             )
 
             self._protocols[header.destination_cid] = protocol
-            self._protocols[connection.host_cid] = protocol
+            #### fix me!!!
+            #self._protocols[connection.host_cid] = protocol
 
         if protocol is not None:
-            protocol.datagram_received(data, addr)
+            protocol.datagram_received(data, addr, local_addr)
+            
+    async def add_datagram_endpoint(self, host = None, port = None):
+        if not host == None and not port == None:
+            addr: NetworkAddress = (host, port)
+        else:
+            addr: NetworkAddress = ("::", 0)
+        transport = TransportWrapper(addr)
+        _transport, _protocol = await transport.create_transport(self._loop, self)
+        self._transports.append(_transport)
 
     def _connection_id_issued(self, cid: bytes, protocol: QuicConnectionProtocol):
         self._protocols[cid] = protocol
@@ -164,6 +183,12 @@ class QuicServer(asyncio.DatagramProtocol):
         for cid, proto in list(self._protocols.items()):
             if proto == protocol:
                 del self._protocols[cid]
+    
+    def _find_transport_no(self, local_addr: NetworkAddress) -> int:
+        for idx, transport in enumerate(self._transports):
+            if transport.local_addr == local_addr:
+                return idx
+        raise ValueError("Transport for local addr %s not available" % str(local_addr))
 
 
 async def serve(
@@ -204,15 +229,35 @@ async def serve(
 
     loop = asyncio.get_running_loop()
 
-    _, protocol = await loop.create_datagram_endpoint(
-        lambda: QuicServer(
-            configuration=configuration,
-            create_protocol=create_protocol,
-            session_ticket_fetcher=session_ticket_fetcher,
-            session_ticket_handler=session_ticket_handler,
-            retry=retry,
-            stream_handler=stream_handler,
-        ),
-        local_addr=(host, port),
+    #transport, protocol = await loop.create_datagram_endpoint(
+    #    lambda: QuicServer(
+    #        configuration=configuration,
+    #        create_protocol=create_protocol,
+    #        session_ticket_fetcher=session_ticket_fetcher,
+    #        session_ticket_handler=session_ticket_handler,
+    #        retry=retry,
+    #        stream_handler=stream_handler,
+    #    ),
+    #    local_addr=(host, port),
+    #)
+    #self._transports.append(transport)
+    
+    
+    protocol = QuicServer(
+        configuration=configuration,
+        create_protocol=create_protocol,
+        session_ticket_fetcher=session_ticket_fetcher,
+        session_ticket_handler=session_ticket_handler,
+        retry=retry,
+        stream_handler=stream_handler,
     )
+    await protocol.add_datagram_endpoint(host, port)
+
+    #if not host2host == None and not host2port == None:
+    #    await protocol.add_datagram_endpoint(host2host, host2port)
+    
+    return cast(QuicServer, protocol)
+
+    
+    
     return protocol

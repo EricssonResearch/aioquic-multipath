@@ -88,7 +88,7 @@ async def connect(
     )
     protocol = cast(QuicConnectionProtocol, protocol)
     try:
-        protocol.connect(addr, transmit=wait_connected)
+        await protocol.connect(addr, local_addr=(local_host, local_port), transmit=wait_connected)
         if wait_connected:
             await protocol.wait_connected()
         yield protocol
@@ -96,3 +96,4 @@ async def connect(
         protocol.close()
         await protocol.wait_closed()
         transport.close()
+

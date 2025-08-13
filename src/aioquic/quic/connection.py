@@ -224,11 +224,11 @@ class QuicNetworkPath:
         self,
         path_id: int,
         host_cid: QuicConnectionId,
-        loss: QuicPacketRecovery,
+        #loss: QuicPacketRecovery,
         peer_cid: Optional[QuicConnectionId] = None,
     ):
         self.path_id: int = path_id
-        self.host_cid=host_cid.cid
+        self.host_cid = host_cid.cid
         self.host_cids: List[QuicConnectionId] = [host_cid]
         self.host_cid_seq: int = 1
         self.peer_cid: QuicConnectionId = peer_cid
@@ -239,7 +239,7 @@ class QuicNetworkPath:
         self.peer_cid_available: List[QuicConnectionId] = []
         self.peer_cid_sequence_numbers: Set[int] = set([0])
         self.peer_retire_prior_to = 0
-        self.loss = loss
+        self.loss: QuicPacketRecovery = None
         self.loss_at: Optional[float] = None
         self.spaces: Dict[tls.Epoch, QuicPacketSpace] = {}
 
@@ -380,6 +380,7 @@ class QuicConnection:
         self._remote_version_information: Optional[QuicVersionInformation] = None
         self._retry_count = 0
         self._retry_source_connection_id = retry_source_connection_id
+        self._spaces: Dict[tls.Epoch, QuicPacketSpace] = {}
         self._spin_bit = False
         self._spin_highest_pn = 0
         self._state = QuicConnectionState.FIRSTFLIGHT
@@ -529,7 +530,6 @@ class QuicConnection:
                 sequence_number=0,
                 was_sent=True,
             ),
-            sequence_number=0,
             peer_cid=QuicConnectionId(
                 self._original_destination_connection_id, sequence_number=None
             ),
@@ -792,9 +792,14 @@ class QuicConnection:
             # Our peer has a preference too, so pick the smaller timeout.
             idle_timeout = min(idle_timeout, self._remote_max_idle_timeout)
         # But not too small!
-        return max(idle_timeout, 3 * self._loss.get_probe_timeout())
+        #### warning hard-coded path ID 0
+        #### this should be the max PTO of all path!
+        if self._network_paths[0].loss != None:
+            return max(idle_timeout, 3 * self._network_paths[0].loss.get_probe_timeout())
+        else:
+            return idle_timeout
 
-    def receive_datagram(self, data: bytes, addr: NetworkAddress, now: float) -> None:
+    def receive_datagram(self, data: bytes, addr: NetworkAddress, addr_local: NetworkAddress, now: float) -> None:
         """
         Handle an incoming datagram.
 
@@ -805,7 +810,7 @@ class QuicConnection:
         :param now: The current time.
         """
         remote_addr = addr # tmp fix for testing
-        local_addr = ("::ffff:127.0.0.1", 1234, 0, 0) # tmp dummy addr
+        local_addr = addr_local #("::ffff:127.0.0.1", 1234, 0, 0) # tmp dummy addr
         destination_cid = os.urandom(self._configuration.connection_id_length) # tmp dummy cid
         payload_length = len(data)
 
@@ -839,7 +844,7 @@ class QuicConnection:
         # long-header packets, which is legitimate behaviour.
         #
         # https://datatracker.ietf.org/doc/html/rfc9000#section-8.1
-        network_path = self._find_network_path(destination_cid)
+        network_path = self._find_network_path(remote_addr, local_addr)
         path_tuple = self._find_path_tuple(remote_addr, local_addr, network_path.path_id)
         if not path_tuple.is_validated:
             path_tuple.bytes_received += payload_length
@@ -1317,7 +1322,8 @@ class QuicConnection:
         """
         Begin the close procedure.
         """
-        self._close_at = now + 3 * self._loss.get_probe_timeout()
+        ##### warning hard-coded path ID 0
+        self._close_at = now + 3 * self._network_paths[0].loss.get_probe_timeout()
         if is_initiator:
             self._set_state(QuicConnectionState.CLOSING)
         else:
@@ -1380,13 +1386,15 @@ class QuicConnection:
             network_path.loss.discard_space(network_path.spaces[epoch])
             network_path.spaces[epoch].discarded = True
 
-    def _find_network_path(self, destination_cid: bytes) -> QuicNetworkPath:
-        return self._network_paths[0] # tmp fixed to path 0
+    #def _find_network_path(self, destination_cid: bytes) -> QuicNetworkPath:
+    def _find_network_path(self, remote_addr: NetworkAddress, local_addr: NetworkAddress,) -> QuicNetworkPath:
+        if len(self._network_paths) != 0:
+            return self._network_paths[0] # tmp fixed to path 0
         # check existing network paths
-        for idx, network_path in enumerate(self._network_paths):
-            for host_cid in network_path.host_cids:
-                if host_cid.cid == destination_cid:
-                    return network_path
+        #for np in self._network_paths.values():
+        #    for host_cid in np.host_cids:
+        #        if host_cid.cid == destination_cid:
+        #            return np
         
         if not self._is_client and len(self._network_paths) == 0:
             network_path = QuicNetworkPath(
@@ -1396,12 +1404,27 @@ class QuicConnection:
                     sequence_number=0,
                     was_sent=True,
                 ),
-                sequence_number=0,
+                #sequence_number=0,
                 peer_cid=QuicConnectionId(
                     os.urandom(self._configuration.connection_id_length), sequence_number=None
                 ),
             )
             self._network_paths = {0: network_path}
+            self._network_paths[0].path_tuples = [PathTuple(
+                local_addr=local_addr,
+                remote_addr=remote_addr,
+                is_validated=True,
+            )]
+            self._network_paths[0].active_path_tuple = self._network_paths[0].path_tuples[0]
+            self._network_paths[0].loss = QuicPacketRecovery(
+                congestion_control_algorithm=self._configuration.congestion_control_algorithm,
+                initial_rtt=self._configuration.initial_rtt,
+                max_datagram_size=self._max_datagram_size,
+                peer_completed_address_validation=not self._is_client,
+                quic_logger=self._quic_logger,
+                send_probe=lambda: self._send_probe(0),
+                logger=self._logger,
+            )
             return network_path
 
         # todo: Further cases of 'destination CID cannot be matched'
@@ -1413,7 +1436,7 @@ class QuicConnection:
             path_id: int,
         ) -> PathTuple:
         # check exising path tuples
-        for path_tuple in self._network_paths[path_id]:
+        for path_tuple in self._network_paths[path_id].path_tuples:
             if (
                 path_tuple.remote_addr == remote_addr and 
                 path_tuple.local_addr == local_addr
@@ -2940,7 +2963,8 @@ class QuicConnection:
             if quic_transport_parameters.ack_delay_exponent is not None:
                 self._remote_ack_delay_exponent = self._remote_ack_delay_exponent
             if quic_transport_parameters.max_ack_delay is not None:
-                self._loss.max_ack_delay = (
+                #### warning hard-coded path ID of 0
+                self._network_paths[0].loss.max_ack_delay = (
                     quic_transport_parameters.max_ack_delay / 1000.0
                 )
             if (
@@ -2998,7 +3022,8 @@ class QuicConnection:
                 if self._configuration.quantum_readiness_test
                 else None
             ),
-            stateless_reset_token=self._host_cids[0].stateless_reset_token,
+            #### warning hard-coded path ID 0
+            stateless_reset_token=self._network_paths[0].host_cids[0].stateless_reset_token,
             version_information=QuicVersionInformation(
                 chosen_version=self._version,
                 available_versions=self._configuration.supported_versions,
