@@ -201,13 +201,13 @@ class QuicConnectionProtocol(asyncio.DatagramProtocol):
     #def connection_made(self, transport: asyncio.BaseTransport) -> None:
     #    """:meta private:"""
     #    self._transports.append(cast(asyncio.DatagramTransport, transport))
-    def connection_made(self, transports: List[asyncio.BaseTransport]) -> None:
+    def connection_made_server(self, transports: List[asyncio.BaseTransport]) -> None:
         """:meta private:"""
         self._transports += transports
-    #def connection_made(self, transport: asyncio.BaseTransport) -> None:
-    #    local_addr = transport.get_extra_info('sockname')[0:2]
-    #    _transport = TransportWrapper(local_addr=local_addr, transport=transport)
-    #    self._transports.append(_transport)
+    def connection_made(self, transport: asyncio.BaseTransport) -> None:
+        local_addr = transport.get_extra_info('sockname')[0:2]
+        _transport = TransportWrapper(local_addr=local_addr, transport=transport)
+        self._transports.append(_transport)
         
     def datagram_received(self, data: Union[bytes, Text], addr: NetworkAddress, local_addr: NetworkAddress) -> None:
         """:meta private:"""

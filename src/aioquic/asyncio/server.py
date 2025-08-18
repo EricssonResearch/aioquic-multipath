@@ -1,7 +1,7 @@
 import asyncio
 import os
 from functools import partial
-from typing import Callable, Dict, Optional, Text, Union, cast
+from typing import Callable, Dict, Optional, Text, Union, cast, List
 
 from ..buffer import Buffer
 from ..quic.configuration import SMALLEST_MAX_DATAGRAM_SIZE, QuicConfiguration
@@ -60,10 +60,15 @@ class QuicServer(asyncio.DatagramProtocol):
 
     #def connection_made(self, transport: asyncio.BaseTransport) -> None:
     #    self._transport = cast(asyncio.DatagramTransport, transport)
-    def connection_made(self, transport: asyncio.BaseTransport) -> None:
-        local_addr = transport.get_extra_info('sockname')[0:2]
-        _transport = TransportWrapper(local_addr=local_addr, transport=transport)
-        self._transports.append(_transport)
+    #def connection_made(self, transport: asyncio.BaseTransport) -> None:
+    #    print("connection_made2")
+    #    local_addr = transport.get_extra_info('sockname')[0:2]
+    #    _transport = TransportWrapper(local_addr=local_addr, transport=transport)
+    #    self._transports.append(_transport)
+    #def connection_made_server(self, transports: List[asyncio.BaseTransport]) -> None:
+    #    """:meta private:"""
+    #    print("connection_made1 in server")
+    #    self._transports += transports
 
     def datagram_received(self, data: Union[bytes, Text], addr: NetworkAddress, local_addr: NetworkAddress) -> None:
         transport_no = self._find_transport_no(local_addr)
@@ -141,7 +146,7 @@ class QuicServer(asyncio.DatagramProtocol):
             protocol = self._create_protocol(
                 connection, stream_handler=self._stream_handler
             )
-            protocol.connection_made(self._transports)
+            protocol.connection_made_server(self._transports)
 
             # register callbacks
             protocol._connection_id_issued_handler = partial(
