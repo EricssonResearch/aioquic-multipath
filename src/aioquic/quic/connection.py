@@ -1800,7 +1800,7 @@ class QuicConnection:
                     self._handshake_confirmed = True
                     self._handshake_done_pending = True
 
-                self._replenish_connection_ids()
+                self._replenish_connection_ids(0) #### warning: hard-code path id 0 !!!!
                 self._events.append(
                     events.HandshakeCompleted(
                         alpn_protocol=self.tls.alpn_negotiated,
@@ -2642,7 +2642,7 @@ class QuicConnection:
             and header.integrity_tag
             == get_retry_integrity_tag(
                 packet_without_tag,
-                self._peer_cid.cid,
+                self._network_paths[0].peer_cid.cid, #### warning: hard-code path id 0 !!!
                 version=header.version,
             )
         ):
@@ -2969,10 +2969,10 @@ class QuicConnection:
                 )
             if (
                 self._is_client
-                and self._peer_cid.sequence_number == 0
+                and self._network_paths[0].peer_cid.sequence_number == 0 #### warning: hard-code path id 0 !!!!
                 and quic_transport_parameters.stateless_reset_token is not None
             ):
-                self._peer_cid.stateless_reset_token = (
+                self._network_paths[0].peer_cid.stateless_reset_token = ( #### warning: hard-code path id 0 !!!!
                     quic_transport_parameters.stateless_reset_token
                 )
             self._remote_version_information = (
