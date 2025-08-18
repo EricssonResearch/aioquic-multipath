@@ -811,7 +811,7 @@ class QuicConnection:
         """
         remote_addr = addr # tmp fix for testing
         local_addr = addr_local #("::ffff:127.0.0.1", 1234, 0, 0) # tmp dummy addr
-        destination_cid = os.urandom(self._configuration.connection_id_length) # tmp dummy cid
+        #destination_cid = os.urandom(self._configuration.connection_id_length) # tmp dummy cid
         payload_length = len(data)
 
         # stop handling packets when closing
