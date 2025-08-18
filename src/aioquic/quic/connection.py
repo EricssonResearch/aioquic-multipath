@@ -1334,8 +1334,8 @@ class QuicConnection:
         End the close procedure.
         """
         self._close_at = None
-        for epoch in self._spaces.keys():
-            self._discard_epoch(epoch)
+        for epoch in self._network_paths[0].spaces.keys():
+            self._discard_epoch(epoch, 0) # warning: hard-coded path id 0 !!!
         self._events.append(self._close_event)
         self._set_state(QuicConnectionState.TERMINATED)
 
