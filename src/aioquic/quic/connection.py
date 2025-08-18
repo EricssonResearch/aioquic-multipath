@@ -380,7 +380,7 @@ class QuicConnection:
         self._remote_version_information: Optional[QuicVersionInformation] = None
         self._retry_count = 0
         self._retry_source_connection_id = retry_source_connection_id
-        self._spaces: Dict[tls.Epoch, QuicPacketSpace] = {}
+#        self._spaces: Dict[tls.Epoch, QuicPacketSpace] = {}
         self._spin_bit = False
         self._spin_highest_pn = 0
         self._state = QuicConnectionState.FIRSTFLIGHT
@@ -1334,8 +1334,8 @@ class QuicConnection:
         End the close procedure.
         """
         self._close_at = None
-        for epoch in self._spaces.keys():
-            self._discard_epoch(epoch)
+        for epoch in self._network_paths[0].spaces.keys():
+            self._discard_epoch(epoch, 0) # warning: hard-coded path id 0 !!!
         self._events.append(self._close_event)
         self._set_state(QuicConnectionState.TERMINATED)
 
