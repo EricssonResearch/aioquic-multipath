@@ -357,7 +357,7 @@ class HttpServerProtocol(QuicConnectionProtocol):
             self._quic._logger.info("HTTP request %s %s", method, path)
 
             # FIXME: add a public API to retrieve peer address
-            client_addr = self._http._quic._network_paths[0].addr
+            client_addr = self._http._quic._network_paths[0].path_tuples[0].remote_addr # FIXME: solve temporary hack
             client = (client_addr[0], client_addr[1])
 
             handler: Handler
