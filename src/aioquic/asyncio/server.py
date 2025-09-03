@@ -160,8 +160,7 @@ class QuicServer(asyncio.DatagramProtocol):
             )
 
             self._protocols[header.destination_cid] = protocol
-            #### fix me!!!
-            #self._protocols[connection.host_cid] = protocol
+            self._protocols[connection.original_host_connection_id] = protocol
 
         if protocol is not None:
             protocol.datagram_received(data, addr, local_addr)

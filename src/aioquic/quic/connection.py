@@ -324,6 +324,8 @@ class QuicConnection:
         self._configuration = configuration
         self._is_client = configuration.is_client
 
+        self.original_host_connection_id: bytes = os.urandom(self._configuration.connection_id_length)
+
         self._ack_delay = K_GRANULARITY
         self._close_at: Optional[float] = None
         self._close_event: Optional[events.ConnectionTerminated] = None
@@ -523,8 +525,9 @@ class QuicConnection:
         self._network_paths = {0: QuicNetworkPath(
             path_id=0,
             host_cid=QuicConnectionId(
-                cid=os.urandom(self._configuration.connection_id_length),
+                cid=self.original_host_connection_id,
                 sequence_number=0,
+                stateless_reset_token=None,
                 was_sent=True,
             ),
             peer_cid=QuicConnectionId(
@@ -1400,7 +1403,7 @@ class QuicConnection:
             network_path = QuicNetworkPath(
                 path_id=0,
                 host_cid=QuicConnectionId(
-                    cid=os.urandom(self._configuration.connection_id_length),
+                    cid=self.original_host_connection_id,
                     sequence_number=0,
                     was_sent=True,
                 ),
