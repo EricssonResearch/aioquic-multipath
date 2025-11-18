@@ -111,7 +111,7 @@ TRANSPORT_CLOSE_FRAME_CAPACITY = 1 + 3 * UINT_VAR_MAX_SIZE  # + reason length
 # frame sizes multipath QUIC
 MAX_PATH_ID_FRAME_CAPACITY = 4 + 1 * UINT_VAR_MAX_SIZE
 PATH_ACK_FRAME_CAPACITY = 64  # FIXME: this is arbitrary!
-PATH_NEW_CONNECTIION_ID_FRAME_CAPACITY = 4 + 3 * UINT_VAR_MAX_SIZE + 1 + 20 + 16
+PATH_NEW_CONNECTIION_ID_FRAME_CAPACITY = 4 + 3 * UINT_VAR_MAX_SIZE + 1 + 20 + 16 # FIXME: adapt when types are standardized / fixed
 PATH_RETIRE_CONNECTION_ID_FRAME_CAPACITY = 4 + 2 * UINT_VAR_MAX_SIZE
 PATH_ABANDON_FRAME_CAPACITY = 4 + 3 * UINT_VAR_MAX_SIZE # + reason length # FIXME: adapt when types are standardized / fixed
 PATH_AVAILABLE_FRAME_CAPACITY = 4 + 2 * UINT_VAR_MAX_SIZE
@@ -1679,7 +1679,7 @@ class QuicConnection:
             ack_rangeset=ack_rangeset,
             ack_delay=ack_delay,
             now=context.time,
-            space=ONE_RTT, # PATH_ACK_FRAME can only be in 1-RTT - But need to check somewhere?
+            space=QuicPacketType.ONE_RTT, # PATH_ACK_FRAME can only be in 1-RTT - But need to check somewhere?
         )
 
         # update idle timeout
@@ -3160,7 +3160,7 @@ class QuicConnection:
                             builder=builder,
                             space=space,
                             now=now,
-                            ack_path_id=ack_path_id
+                            ack_path_id=0
                         )
                     else:
                         self._write_ack_frame(builder=builder, space=space, now=now)
