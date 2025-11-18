@@ -555,6 +555,7 @@ if __name__ == "__main__":
         alpn_protocols=H0_ALPN if args.legacy_http else H3_ALPN,
         congestion_control_algorithm=args.congestion_control_algorithm,
         max_datagram_size=args.max_datagram_size,
+        max_path_id=1, #to enable multipath
     )
     if args.ca_certs:
         configuration.load_verify_locations(args.ca_certs)
@@ -600,6 +601,5 @@ if __name__ == "__main__":
             output_dir=args.output_dir,
             local_port=args.local_port,
             zero_rtt=args.zero_rtt,
-            #max_path_id=1, #to enable multipath
         )
     )
