@@ -43,6 +43,10 @@ class QuicErrorCode(IntEnum):
     AEAD_LIMIT_REACHED = 0xF
     VERSION_NEGOTIATION_ERROR = 0x11
     CRYPTO_ERROR = 0x100
+    APPLICATION_ABANDON = 0x004150504142414e
+    RESOURCE_LIMIT_REACHED = 0x0052534c494d4954
+    UNSTABLE_INTERFACE = 0x00554e5f494e5446
+    NO_CID_AVAILABLE = 0x004e4f5f4349445f
 
 
 class QuicPacketType(Enum):
@@ -643,6 +647,42 @@ def push_ack_frame(buf: Buffer, rangeset: RangeSet, delay: int) -> int:
     ranges = len(rangeset)
     index = ranges - 1
     r = rangeset[index]
+    buf.push_uint_var(r.stop - 1)
+    buf.push_uint_var(delay)
+    buf.push_uint_var(index)
+    buf.push_uint_var(r.stop - 1 - r.start)
+    start = r.start
+    while index > 0:
+        index -= 1
+        r = rangeset[index]
+        buf.push_uint_var(start - r.stop - 1)
+        buf.push_uint_var(r.stop - r.start - 1)
+        start = r.start
+    return ranges
+    
+
+def pull_path_ack_frame(buf: Buffer) -> Tuple[int, RangeSet, int]:
+    rangeset = RangeSet()
+    path_id = buf.pull_uint_var()
+    end = buf.pull_uint_var()  # largest acknowledged
+    delay = buf.pull_uint_var()
+    ack_range_count = buf.pull_uint_var()
+    ack_count = buf.pull_uint_var()  # first ack range
+    rangeset.add(end - ack_count, end + 1)
+    end -= ack_count
+    for _ in range(ack_range_count):
+        end -= buf.pull_uint_var() + 2
+        ack_count = buf.pull_uint_var()
+        rangeset.add(end - ack_count, end + 1)
+        end -= ack_count
+    return path_id, rangeset, delay
+
+
+def push_path_ack_frame(buf: Buffer, rangeset: RangeSet, delay: int, ack_path_id: int) -> int:
+    ranges = len(rangeset)
+    index = ranges - 1
+    r = rangeset[index]
+    buf.push_uint_var(ack_path_id)
     buf.push_uint_var(r.stop - 1)
     buf.push_uint_var(delay)
     buf.push_uint_var(index)
