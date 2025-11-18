@@ -363,6 +363,7 @@ class QuicTransportParameters:
     initial_max_stream_data_uni: Optional[int] = None
     initial_max_streams_bidi: Optional[int] = None
     initial_max_streams_uni: Optional[int] = None
+    initial_max_path_id: Optional[int] = None
     ack_delay_exponent: Optional[int] = None
     max_ack_delay: Optional[int] = None
     disable_active_migration: Optional[bool] = False
@@ -386,6 +387,7 @@ PARAMS = {
     0x07: ("initial_max_stream_data_uni", int),
     0x08: ("initial_max_streams_bidi", int),
     0x09: ("initial_max_streams_uni", int),
+    0x0f739bbc1b666d0d: ("initial_max_path_id", int),
     0x0A: ("ack_delay_exponent", int),
     0x0B: ("max_ack_delay", int),
     0x0C: ("disable_active_migration", bool),
@@ -556,12 +558,25 @@ class QuicFrameType(IntEnum):
     HANDSHAKE_DONE = 0x1E
     DATAGRAM = 0x30
     DATAGRAM_WITH_LENGTH = 0x31
+    PATH_ABANDON = 0x15228c05
+    PATH_AVAILABLE = 0x15228c08
+    PATH_BACKUP = 0x15228c07
+    PATHS_BLOCKED = 0x15228c0d
+    PATH_CIDS_BLOCKED =  0x15228c0e
+    MAX_PATH_ID = 0x15228c0c
+    PATH_ACK = 0x15228c00
+    PATH_ACK_ECN = 0x15228c01
+    PATH_NEW_CONNECTIION_ID = 0x15228c09
+    PATH_RETIRE_CONNECTION_ID = 0x15228c0a
+
 
 
 NON_ACK_ELICITING_FRAME_TYPES = frozenset(
     [
         QuicFrameType.ACK,
         QuicFrameType.ACK_ECN,
+        QuicFrameType.PATH_ACK,
+        QuicFrameType.PATH_ACK_ECN,
         QuicFrameType.PADDING,
         QuicFrameType.TRANSPORT_CLOSE,
         QuicFrameType.APPLICATION_CLOSE,
@@ -571,6 +586,8 @@ NON_IN_FLIGHT_FRAME_TYPES = frozenset(
     [
         QuicFrameType.ACK,
         QuicFrameType.ACK_ECN,
+        QuicFrameType.PATH_ACK,
+        QuicFrameType.PATH_ACK_ECN,
         QuicFrameType.TRANSPORT_CLOSE,
         QuicFrameType.APPLICATION_CLOSE,
     ]

@@ -615,5 +615,6 @@ if __name__ == "__main__":
             local_port=args.local_port,
             key_update=args.key_update,
             zero_rtt=args.zero_rtt,
+            #max_path_id=1, #to enable multipath
         )
     )

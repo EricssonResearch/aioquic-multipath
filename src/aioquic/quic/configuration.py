@@ -64,6 +64,12 @@ class QuicConfiguration:
     """
     Per-stream flow control limit.
     """
+    
+    max_path_id: Optional[int] = None
+    """
+    Maximal connectioon-wide path ID value. Limits effectively the number of paths. 
+    Also, enables multipath extension. If no max_path_id set, multipath is not used.
+    """
 
     quic_logger: Optional[QuicLogger] = None
     """

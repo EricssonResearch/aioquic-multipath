@@ -89,7 +89,7 @@ MAX_PENDING_CRYPTO = 524288  # in bytes
 
 NetworkAddress = Any
 
-# frame sizes
+# frame sizes single path QUIC
 ACK_FRAME_CAPACITY = 64  # FIXME: this is arbitrary!
 APPLICATION_CLOSE_FRAME_CAPACITY = 1 + 2 * UINT_VAR_MAX_SIZE  # + reason length
 CONNECTION_LIMIT_FRAME_CAPACITY = 1 + UINT_VAR_MAX_SIZE
@@ -106,6 +106,17 @@ RETIRE_CONNECTION_ID_CAPACITY = 1 + UINT_VAR_MAX_SIZE
 STOP_SENDING_FRAME_CAPACITY = 1 + 2 * UINT_VAR_MAX_SIZE
 STREAMS_BLOCKED_CAPACITY = 1 + UINT_VAR_MAX_SIZE
 TRANSPORT_CLOSE_FRAME_CAPACITY = 1 + 3 * UINT_VAR_MAX_SIZE  # + reason length
+
+# frame sizes multipath QUIC
+MAX_PATH_ID_FRAME_CAPACITY = 4 + 1 * UINT_VAR_MAX_SIZE
+PATH_ACK_FRAME_CAPACITY = 64  # FIXME: this is arbitrary!
+PATH_NEW_CONNECTIION_ID_FRAME_CAPACITY = 4 + 3 * UINT_VAR_MAX_SIZE + 1 + 20 + 16
+PATH_RETIRE_CONNECTION_ID_FRAME_CAPACITY = 4 + 2 * UINT_VAR_MAX_SIZE
+PATH_ABANDON_FRAME_CAPACITY = 4 + 3 * UINT_VAR_MAX_SIZE # + reason length # FIXME: adapt when types are standardized / fixed
+PATH_AVAILABLE_FRAME_CAPACITY = 4 + 2 * UINT_VAR_MAX_SIZE
+PATH_BACKUP_FRAME_CAPACITY = 4 + 2 * UINT_VAR_MAX_SIZE
+PATHS_BLOCKED_CAPACITY = 4 + UINT_VAR_MAX_SIZE
+PATH_CIDS_BLOCKED_CAPACITY = 4 + 2 * UINT_VAR_MAX_SIZE
 
 
 def EPOCHS(shortcut: str) -> FrozenSet[tls.Epoch]:
@@ -278,6 +289,7 @@ class QuicConnection:
         self._events: Deque[events.QuicEvent] = deque()
         self._handshake_complete = False
         self._handshake_confirmed = False
+        self._multipath_negotiated = False
         self._local_ack_delay_exponent = 3
         self._local_active_connection_id_limit = 8
         self._local_max_data = Limit(
@@ -300,6 +312,7 @@ class QuicConnection:
         self._local_next_stream_id_uni = 2 if self._is_client else 3
         self._max_ack_delay = 0.025
         self._max_datagram_size = configuration.max_datagram_size
+        self._max_path_id = configuration.max_path_id
         self._network_paths: Dict[int, QuicNetworkPath] = {}
         self._path_ids: Dict[bytes, int] = {}
         self._peer_token = configuration.token
@@ -316,6 +329,7 @@ class QuicConnection:
         self._remote_max_stream_data_uni = 0
         self._remote_max_streams_bidi = 0
         self._remote_max_streams_uni = 0
+        self._remote_max_path_id = None
         self._remote_version_information: Optional[QuicVersionInformation] = None
         self._retry_count = 0
         self._retry_source_connection_id = retry_source_connection_id
@@ -356,6 +370,11 @@ class QuicConnection:
         self._ping_pending: List[int] = []
         self._probe_pending = False
         self._streams_blocked_pending = False
+        self._max_path_id_pending: Dict[int, int] = {} # max_path_id: tx_path_id
+        self._path_abandon: Dict[int, int] = {} # path_id: tx_path_id
+        self._set_paths_to_available: Dict[int, int] = {} # path_id: tx_path_id
+        self._set_paths_to_standby: Dict[int, int] = {} # path_id: tx_path_id
+
 
         # callbacks
         self._session_ticket_fetcher = session_ticket_fetcher
@@ -2804,6 +2823,26 @@ class QuicConnection:
                         f"max_udp_payload_size must be >= {SMALLEST_MAX_DATAGRAM_SIZE}"
                     ),
                 )
+            if (
+                quic_transport_parameters.initial_max_path_id is not None
+                and quic_transport_parameters.initial_max_path_id > 2**32-1
+            ):
+                raise QuicConnectionError(
+                    error_code=QuicErrorCode.TRANSPORT_PARAMETER_ERROR,
+                    frame_type=QuicFrameType.CRYPTO,
+                    reason_phrase="initial_max_path_id must be <= 2^32-1",
+                )
+            if (
+                quic_transport_parameters.initial_max_path_id is not None
+                and len(context.host_cid) == 0 # todo: verify, this comparison is valid
+            ):
+                raise QuicConnectionError(
+                    error_code=QuicErrorCode.PROTOCOL_VIOLATION,
+                    frame_type=QuicFrameType.CRYPTO,
+                    reason_phrase="Zero-length CIDs are not allowed \
+                        with initial_max_path_id transport parameter"
+                )
+
 
             # Validate Version Information extension.
             #
@@ -2867,9 +2906,16 @@ class QuicConnection:
             self._remote_max_idle_timeout = (
                 quic_transport_parameters.max_idle_timeout / 1000.0
             )
+        if quic_transport_parameters.initial_max_path_id is not None:
+            if self._remote_max_path_id is not None:
+                self._remote_max_path_id = (
+                    quic_transport_parameters.initial_max_path_id
+                )
+                self._multipath_negotiated = True
         self._remote_max_datagram_frame_size = (
             quic_transport_parameters.max_datagram_frame_size
         )
+
         for param in [
             "max_data",
             "max_stream_data_bidi_local",
@@ -2895,6 +2941,7 @@ class QuicConnection:
             initial_max_stream_data_uni=self._local_max_stream_data_uni,
             initial_max_streams_bidi=self._local_max_streams_bidi.value,
             initial_max_streams_uni=self._local_max_streams_uni.value,
+            initial_max_path_id=self._max_path_id,
             initial_source_connection_id=self._local_initial_source_connection_id,
             max_ack_delay=25,
             max_datagram_frame_size=self._configuration.max_datagram_frame_size,
