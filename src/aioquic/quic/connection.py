@@ -49,9 +49,11 @@ from .packet import (
     get_spin_bit,
     pretty_protocol_version,
     pull_ack_frame,
+    pull_path_ack_frame,
     pull_quic_header,
     pull_quic_transport_parameters,
     push_ack_frame,
+    push_path_ack_frame,
     push_quic_transport_parameters,
 )
 from .packet_builder import QuicDeliveryState, QuicPacketBuilder, QuicPacketBuilderStop
@@ -480,6 +482,9 @@ class QuicConnection:
             0x1E: (self._handle_handshake_done_frame, EPOCHS("1")),
             0x30: (self._handle_datagram_frame, EPOCHS("01")),
             0x31: (self._handle_datagram_frame, EPOCHS("01")),
+            0x15228c00: (self._handle_path_ack_frame, EPOCHS("1")),
+            0x15228c01: (self._handle_path_ack_frame, EPOCHS("1")),
+
         }
 
     @property
@@ -1733,6 +1738,48 @@ class QuicConnection:
             now=context.time,
             space=network_path.spaces[context.epoch],
         )
+        
+
+    def _handle_path_ack_frame(
+        self, context: QuicReceiveContext, frame_type: int, buf: Buffer
+    ) -> None:
+        """
+        Handle an PATH_ACK frame.
+        """
+        path_id, ack_rangeset, ack_delay_encoded = pull_path_ack_frame(buf)
+        if frame_type == QuicFrameType.PATH_ACK_ECN:
+            buf.pull_uint_var()
+            buf.pull_uint_var()
+            buf.pull_uint_var()
+        ack_delay = (ack_delay_encoded << self._remote_ack_delay_exponent) / 1000000
+
+        # validate path_id
+        if path_id not in self._network_paths:
+            self._logger.info(f"Discard PATH_ACK frame for unknown path id {path_id}.")
+            return
+        
+        # log frame
+        if self._quic_logger is not None:
+            context.quic_logger_frames.append(
+                self._quic_logger.encode_path_ack_frame(
+                    ack_rangeset,
+                    ack_delay,
+                    path_id,
+                    self._quic_paths[path_id].host_cid.cid
+                )
+            )
+
+        any_is_non_probing = self._network_paths[path_id].loss.on_ack_received(
+            ack_rangeset=ack_rangeset,
+            ack_delay=ack_delay,
+            now=context.time,
+            space=ONE_RTT, # PATH_ACK_FRAME can only be in 1-RTT - But need to check somewhere?
+        )
+
+        # update idle timeout
+        if any_is_non_probing:
+            self._network_paths[path_id].close_at = context.time + min(self._configuration.idle_timeout, self._remote_max_idle_timeout)
+
 
     def _handle_connection_close_frame(
         self, context: QuicReceiveContext, frame_type: int, buf: Buffer
