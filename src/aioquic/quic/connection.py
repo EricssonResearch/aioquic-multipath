@@ -1,4 +1,3 @@
-import binascii
 import logging
 import os
 from collections import deque
@@ -52,6 +51,7 @@ from .packet import (
     push_quic_transport_parameters,
 )
 from .packet_builder import QuicDeliveryState, QuicPacketBuilder, QuicPacketBuilderStop
+from .path import PathTuple, QuicConnectionId, QuicNetworkPath, dump_cid
 from .recovery import QuicPacketRecovery, QuicPacketSpace
 from .stream import FinalSizeError, QuicStream, StreamFinishedError
 
@@ -124,10 +124,6 @@ def is_version_compatible(from_version: int, to_version: int) -> bool:
     )
 
 
-def dump_cid(cid: bytes) -> str:
-    return binascii.hexlify(cid).decode("ascii")
-
-
 def get_epoch(packet_type: QuicPacketType) -> tls.Epoch:
     if packet_type == QuicPacketType.INITIAL:
         return tls.Epoch.INITIAL
@@ -180,69 +176,12 @@ class QuicConnectionAdapter(logging.LoggerAdapter):
         return "[%s] %s" % (self.extra["id"], msg), kwargs
 
 
-@dataclass
-class QuicConnectionId:
-    cid: bytes
-    sequence_number: Optional[int]
-    stateless_reset_token: bytes = b""
-    was_sent: bool = False
-
-
 class QuicConnectionState(Enum):
     FIRSTFLIGHT = 0
     CONNECTED = 1
     CLOSING = 2
     DRAINING = 3
     TERMINATED = 4
-
-
-class PathTuple:
-    def __init__(
-        self, 
-        local_addr: NetworkAddress, 
-        remote_addr: NetworkAddress, 
-        is_validated: bool = False
-    ):
-        self.local_addr: NetworkAddress = local_addr
-        self.remote_addr: NetworkAddress = remote_addr
-        self.bytes_received: int = 0
-        self.bytes_sent: int = 0
-        self.is_validated: bool = is_validated
-        self.local_challenges: Deque[bytes] = deque()
-        self.local_challenge_sent: bool = False
-        self.remote_challenges: Deque[bytes] = deque()
-
-    def can_send(self, size: int) -> bool:
-        return self.is_validated or (self.bytes_sent + size) <= 3 * self.bytes_received
-
-
-class QuicNetworkPath:
-    def __init__(
-        self,
-        path_id: int,
-        path_tuple: PathTuple,
-        host_cid: QuicConnectionId,
-        peer_cid: QuicConnectionId,
-        loss: QuicPacketRecovery,
-    ):
-        self.path_id: int = path_id
-        self.host_cid = host_cid.cid
-        self.host_cids: List[QuicConnectionId] = [host_cid]
-        self.host_cid_seq: int = 1
-        self.peer_cid: QuicConnectionId = peer_cid
-        self.path_tuples: List[PathTuple] = [path_tuple]
-        self.active_path_tuple: PathTuple = path_tuple
-        self.pacing_at: Optional[float] = None
-        self.packet_number: int = 0
-        self.peer_cid_available: List[QuicConnectionId] = []
-        self.peer_cid_sequence_numbers: Set[int] = set([0])
-        self.peer_retire_prior_to = 0
-        self.loss = loss
-        self.loss_at: Optional[float] = None
-        self.spaces: Dict[tls.Epoch, QuicPacketSpace] = {}
-
-        # things to send
-        self.retire_connection_ids: List[int] = []
 
 
 @dataclass
@@ -467,22 +406,6 @@ class QuicConnection:
     @property
     def original_destination_connection_id(self) -> bytes:
         return self._original_destination_connection_id
-
-    def change_connection_id(self, path_id) -> None:
-        """
-        Switch to the next available connection ID and retire
-        the previous one.
-
-        .. aioquic_transmit::
-
-        :param path_id: The path_id of the path that should change the connection ID.
-        """
-        if self._network_paths[path_id].peer_cid_available:
-            # retire previous CID
-            self._retire_peer_cid(path_id, self._network_paths[path_id].peer_cid)
-
-            # assign new CID
-            self._consume_peer_cid(path_id)
 
     def close(
         self,
@@ -1045,8 +968,7 @@ class QuicConnection:
 
             # update state
             if network_path.peer_cid.sequence_number is None:
-                network_path.peer_cid.cid = header.source_cid
-                network_path.peer_cid.sequence_number = 0
+                network_path.init_peer_cid(header.source_cid, 0)
 
             if self._state == QuicConnectionState.FIRSTFLIGHT:
                 self._remote_initial_source_connection_id = header.source_cid
@@ -1111,7 +1033,7 @@ class QuicConnection:
                     destination_cid_seq,
                 )
                 network_path.host_cid = context.host_cid
-                self.change_connection_id()
+                network_path.change_connection_id()
 
             # update network path
             if not path_tuple.is_validated and epoch == tls.Epoch.HANDSHAKE:
@@ -1299,20 +1221,6 @@ class QuicConnection:
                 reason_phrase="Stream is receive-only",
             )
 
-    def _consume_peer_cid(self, path_id: int) -> None:
-        """
-        Update the destination connection ID by taking the next
-        available connection ID provided by the peer.
-        """
-
-        self._network_paths[path_id].peer_cid = self._network_paths[path_id].peer_cid_available.pop(0)
-        self._logger.debug(
-            "Switching to CID %s (%d) for path %d",
-            dump_cid(self._network_paths[path_id].peer_cid.cid),
-            self._network_paths[path_id].peer_cid.sequence_number,
-            path_id,
-        )
-
     def _close_begin(self, is_initiator: bool, now: float) -> None:
         """
         Begin the close procedure.
@@ -1381,8 +1289,7 @@ class QuicConnection:
                     crypto.recv._teardown_cb = NoCallback
                     crypto.send._teardown_cb = NoCallback
                     crypto.teardown()
-            network_path.loss.discard_space(network_path.spaces[epoch])
-            network_path.spaces[epoch].discarded = True
+            network_path.discard_epoch(epoch)
 
     def _create_network_path(
             self, 
@@ -2063,47 +1970,12 @@ class QuicConnection:
                 reason_phrase="Retire Prior To is greater than Sequence Number",
             )
 
-        # only accept retire_prior_to if it is bigger than the one we know
-        network_path.peer_retire_prior_to = max(retire_prior_to, network_path.peer_retire_prior_to)
+        record_path_id = network_path.handle_new_connection_id_frame(
+            sequence_number, retire_prior_to, connection_id, stateless_reset_token
+        )
 
-        # determine which CIDs to retire
-        change_cid = False
-        retire = [
-            cid
-            for cid in network_path.peer_cid_available
-            if cid.sequence_number < network_path.peer_retire_prior_to
-        ]
-        if network_path.peer_cid.sequence_number < network_path.peer_retire_prior_to:
-            change_cid = True
-            retire.insert(0, network_path.peer_cid)
-
-        # update available CIDs
-        network_path.peer_cid_available = [
-            cid
-            for cid in network_path.peer_cid_available
-            if cid.sequence_number >= network_path.peer_retire_prior_to
-        ]
-        if (
-            sequence_number >= network_path.peer_retire_prior_to
-            and sequence_number not in network_path.peer_cid_sequence_numbers
-        ):
-            network_path.peer_cid_available.append(
-                QuicConnectionId(
-                    cid=connection_id,
-                    sequence_number=sequence_number,
-                    stateless_reset_token=stateless_reset_token,
-                )
-            )
-            network_path.peer_cid_sequence_numbers.add(sequence_number)
+        if record_path_id:
             self._path_ids[connection_id] = context.path_id
-
-        # retire previous CIDs
-        for quic_connection_id in retire:
-            self._retire_peer_cid(context.path_id, quic_connection_id)
-
-        # assign new CID if we retired the active one
-        if change_cid:
-            self._consume_peer_cid(context.path_id)
 
         # check number of active connection IDs, including the selected one
         if 1 + len(network_path.peer_cid_available) > self._local_active_connection_id_limit:
@@ -2115,8 +1987,8 @@ class QuicConnection:
 
         # Check the number of retired connection IDs pending, though with a safer limit
         # than the 2x recommended in section 5.1.2 of the RFC.  Note that we are doing
-        # the check here and not in _retire_peer_cid() because we know the frame type to
-        # use here, and because it is the new connection id path that is potentially
+        # the check here and not in QuicNetworkPath.retire_peer_cid() because we know the frame type
+        # to use here, and because it is the new connection id path that is potentially
         # dangerous.  We may transiently go a bit over the limit due to unacked frames
         # getting added back to the list, but that's ok as it is bounded.
         if len(network_path.retire_connection_ids) > min(
@@ -2802,30 +2674,14 @@ class QuicConnection:
         Generate new connection IDs.
         """
         network_path = self._network_paths[path_id]
-        while len(network_path.host_cids) < min(8, self._remote_active_connection_id_limit):
-            cid = os.urandom(self._configuration.connection_id_length)
-            network_path.host_cids.append(
-                QuicConnectionId(
-                    cid=cid,
-                    sequence_number=network_path.host_cid_seq,
-                    stateless_reset_token=os.urandom(16),
-                )
-            )
-            network_path.host_cid_seq += 1
-            self._path_ids[cid] = path_id
-
-    def _retire_peer_cid(self, path_id: int, connection_id: QuicConnectionId) -> None:
-        """
-        Retire a destination connection ID.
-        """
-        self._logger.debug(
-            "Retiring CID %s (%d) [%d] for path %d",
-            dump_cid(connection_id.cid),
-            connection_id.sequence_number,
-            len(self._network_paths[path_id].retire_connection_ids) + 1,
-            path_id,
+        cids = network_path.replenish_connection_ids(
+            connection_id_length = self._configuration.connection_id_length, 
+            remote_active_connection_id_limit = self._remote_active_connection_id_limit,
         )
-        self._network_paths[path_id].retire_connection_ids.append(connection_id.sequence_number)
+
+        # register CIDs with path_id
+        for cid in cids:
+            self._path_ids[cid] = path_id
 
     def _push_crypto_data(self) -> None:
         for epoch, buf in self._crypto_buffers.items():
