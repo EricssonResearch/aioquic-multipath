@@ -676,22 +676,3 @@ def pull_path_ack_frame(buf: Buffer) -> Tuple[int, RangeSet, int]:
         rangeset.add(end - ack_count, end + 1)
         end -= ack_count
     return path_id, rangeset, delay
-
-
-def push_path_ack_frame(buf: Buffer, rangeset: RangeSet, delay: int, ack_path_id: int) -> int:
-    ranges = len(rangeset)
-    index = ranges - 1
-    r = rangeset[index]
-    buf.push_uint_var(ack_path_id)
-    buf.push_uint_var(r.stop - 1)
-    buf.push_uint_var(delay)
-    buf.push_uint_var(index)
-    buf.push_uint_var(r.stop - 1 - r.start)
-    start = r.start
-    while index > 0:
-        index -= 1
-        r = rangeset[index]
-        buf.push_uint_var(start - r.stop - 1)
-        buf.push_uint_var(r.stop - r.start - 1)
-        start = r.start
-    return ranges

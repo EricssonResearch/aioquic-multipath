@@ -57,6 +57,15 @@ class QuicLoggerTrace:
             "acked_ranges": [[x.start, x.stop - 1] for x in ranges],
             "frame_type": "ack",
         }
+    
+    def encode_path_ack_frame(self, ranges: RangeSet, delay: float, path_id: int, cid: bytes) -> Dict:
+        return {
+            "path_id": path_id,
+            "ack_delay": str(self.encode_time(delay)),
+            "acked_ranges": [[str(x.start), str(x.stop - 1)] for x in ranges],
+            "frame_type": "path_ack",
+        }
+
 
     def encode_connection_close_frame(
         self, error_code: int, frame_type: Optional[int], reason_phrase: str

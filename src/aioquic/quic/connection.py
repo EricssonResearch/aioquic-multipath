@@ -53,7 +53,6 @@ from .packet import (
     pull_quic_header,
     pull_quic_transport_parameters,
     push_ack_frame,
-    push_path_ack_frame,
     push_quic_transport_parameters,
 )
 from .packet_builder import QuicDeliveryState, QuicPacketBuilder, QuicPacketBuilderStop
@@ -2897,7 +2896,9 @@ class QuicConnection:
         self._probe_pending = True
 
     def _parse_transport_parameters(
-        self, data: bytes, from_session_ticket: bool = False
+        self,
+        data: bytes,
+        from_session_ticket: bool = False
     ) -> None:
         """
         Parse and apply remote transport parameters.
@@ -3018,16 +3019,17 @@ class QuicConnection:
                     frame_type=QuicFrameType.CRYPTO,
                     reason_phrase="initial_max_path_id must be <= 2^32-1",
                 )
-            if (
-                quic_transport_parameters.initial_max_path_id is not None
-                and len(context.host_cid) == 0 # todo: verify, this comparison is valid
-            ):
-                raise QuicConnectionError(
-                    error_code=QuicErrorCode.PROTOCOL_VIOLATION,
-                    frame_type=QuicFrameType.CRYPTO,
-                    reason_phrase="Zero-length CIDs are not allowed \
-                        with initial_max_path_id transport parameter"
-                )
+            # todo: check somwehere lese if not zero length CID and disable multipath otherwise
+            #if (
+            #    quic_transport_parameters.initial_max_path_id is not None
+            #    and len(context.host_cid) == 0 # todo: verify, this comparison is valid
+            #):
+            #    raise QuicConnectionError(
+            #        error_code=QuicErrorCode.PROTOCOL_VIOLATION,
+            #        frame_type=QuicFrameType.CRYPTO,
+            #        reason_phrase="Zero-length CIDs are not allowed \
+            #            with initial_max_path_id transport parameter"
+            #    )
 
 
             # Validate Version Information extension.
@@ -3276,7 +3278,20 @@ class QuicConnection:
             if self._handshake_complete:
                 # ACK
                 if space.ack_at is not None and space.ack_at <= now:
-                    self._write_ack_frame(builder=builder, space=space, now=now)
+                #    self._write_ack_frame(builder=builder, space=space, now=now)
+                    
+                # Do we need to check: network_path.is_validated
+                #    and is_current_network_path
+                #    and quic_path.state not in PATH_END_STATES
+                    if self._multipath_negotiated:
+                        self._write_path_ack_frame(
+                            builder=builder,
+                            space=space,
+                            now=now,
+                            ack_path_id=ack_path_id
+                        )
+                    else:
+                        self._write_ack_frame(builder=builder, space=space, now=now)
 
                 # HANDSHAKE_DONE
                 if self._handshake_done_pending:
@@ -3490,6 +3505,44 @@ class QuicConnection:
         # check if we need to trigger an ACK-of-ACK
         if ranges > 1 and builder.packet_number % 8 == 0:
             self._write_ping_frame(builder, comment="ACK-of-ACK trigger")
+    
+    
+    def _write_path_ack_frame(
+        self, builder: QuicPacketBuilder, space: QuicPacketSpace, now: float, ack_path_id: int
+    ) -> None:
+        # calculate ACK delay
+        ack_delay = now - space.largest_received_time
+        ack_delay_encoded = int(ack_delay * 1000000) >> self._local_ack_delay_exponent
+
+        buf = builder.start_frame(
+            QuicFrameType.PATH_ACK,
+            capacity=PATH_ACK_FRAME_CAPACITY,
+            handler=self._on_ack_delivery,
+            handler_args=(space, space.largest_received_packet),
+        )
+        
+        # add path id to frame
+        buf.push_uint_var(ack_path_id)
+        # add ack ranges and delay to frame
+        ranges = push_ack_frame(buf, space.ack_queue, ack_delay_encoded)
+        
+        space.ack_at = None
+
+        # log frame
+        if self._quic_logger is not None:
+            builder.quic_logger_frames.append(
+                self._quic_logger.encode_path_ack_frame(
+                    ranges=space.ack_queue,
+                    delay=ack_delay,
+                    path_id=ack_path_id,
+                    cid=self._quic_paths[ack_path_id].peer_cid.cid
+                )
+            )
+
+        # check if we need to trigger an ACK-of-ACK
+        if ranges > 1 and builder.packet_number % 8 == 0:
+            self._write_ping_frame(builder, comment="ACK-of-ACK trigger")
+
 
     def _write_connection_close_frame(
         self,
