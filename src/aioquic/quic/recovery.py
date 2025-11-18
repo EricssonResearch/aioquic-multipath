@@ -88,13 +88,14 @@ class QuicPacketRecovery:
         *,
         congestion_control_algorithm: str,
         initial_rtt: float,
+        max_ack_delay: float,
         max_datagram_size: int,
         peer_completed_address_validation: bool,
         send_probe: Callable[[], None],
         logger: Optional[logging.LoggerAdapter] = None,
         quic_logger: Optional[QuicLoggerTrace] = None,
     ) -> None:
-        self.max_ack_delay = 0.025
+        self.max_ack_delay = max_ack_delay
         self.peer_completed_address_validation = peer_completed_address_validation
         self.spaces: list[QuicPacketSpace] = []
 
