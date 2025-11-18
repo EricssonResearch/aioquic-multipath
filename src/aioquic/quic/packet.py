@@ -43,6 +43,10 @@ class QuicErrorCode(IntEnum):
     AEAD_LIMIT_REACHED = 0xF
     VERSION_NEGOTIATION_ERROR = 0x11
     CRYPTO_ERROR = 0x100
+    APPLICATION_ABANDON = 0x004150504142414e
+    RESOURCE_LIMIT_REACHED = 0x0052534c494d4954
+    UNSTABLE_INTERFACE = 0x00554e5f494e5446
+    NO_CID_AVAILABLE = 0x004e4f5f4349445f
 
 
 class QuicPacketType(Enum):
@@ -363,6 +367,7 @@ class QuicTransportParameters:
     initial_max_stream_data_uni: Optional[int] = None
     initial_max_streams_bidi: Optional[int] = None
     initial_max_streams_uni: Optional[int] = None
+    initial_max_path_id: Optional[int] = None
     ack_delay_exponent: Optional[int] = None
     max_ack_delay: Optional[int] = None
     disable_active_migration: Optional[bool] = False
@@ -386,6 +391,7 @@ PARAMS = {
     0x07: ("initial_max_stream_data_uni", int),
     0x08: ("initial_max_streams_bidi", int),
     0x09: ("initial_max_streams_uni", int),
+    0x0f739bbc1b666d0d: ("initial_max_path_id", int),
     0x0A: ("ack_delay_exponent", int),
     0x0B: ("max_ack_delay", int),
     0x0C: ("disable_active_migration", bool),
@@ -556,12 +562,25 @@ class QuicFrameType(IntEnum):
     HANDSHAKE_DONE = 0x1E
     DATAGRAM = 0x30
     DATAGRAM_WITH_LENGTH = 0x31
+    PATH_ABANDON = 0x15228c05
+    PATH_AVAILABLE = 0x15228c08
+    PATH_BACKUP = 0x15228c07
+    PATHS_BLOCKED = 0x15228c0d
+    PATH_CIDS_BLOCKED =  0x15228c0e
+    MAX_PATH_ID = 0x15228c0c
+    PATH_ACK = 0x15228c00
+    PATH_ACK_ECN = 0x15228c01
+    PATH_NEW_CONNECTIION_ID = 0x15228c09
+    PATH_RETIRE_CONNECTION_ID = 0x15228c0a
+
 
 
 NON_ACK_ELICITING_FRAME_TYPES = frozenset(
     [
         QuicFrameType.ACK,
         QuicFrameType.ACK_ECN,
+        QuicFrameType.PATH_ACK,
+        QuicFrameType.PATH_ACK_ECN,
         QuicFrameType.PADDING,
         QuicFrameType.TRANSPORT_CLOSE,
         QuicFrameType.APPLICATION_CLOSE,
@@ -571,6 +590,8 @@ NON_IN_FLIGHT_FRAME_TYPES = frozenset(
     [
         QuicFrameType.ACK,
         QuicFrameType.ACK_ECN,
+        QuicFrameType.PATH_ACK,
+        QuicFrameType.PATH_ACK_ECN,
         QuicFrameType.TRANSPORT_CLOSE,
         QuicFrameType.APPLICATION_CLOSE,
     ]
@@ -638,3 +659,20 @@ def push_ack_frame(buf: Buffer, rangeset: RangeSet, delay: int) -> int:
         buf.push_uint_var(r.stop - r.start - 1)
         start = r.start
     return ranges
+    
+
+def pull_path_ack_frame(buf: Buffer) -> Tuple[int, RangeSet, int]:
+    rangeset = RangeSet()
+    path_id = buf.pull_uint_var()
+    end = buf.pull_uint_var()  # largest acknowledged
+    delay = buf.pull_uint_var()
+    ack_range_count = buf.pull_uint_var()
+    ack_count = buf.pull_uint_var()  # first ack range
+    rangeset.add(end - ack_count, end + 1)
+    end -= ack_count
+    for _ in range(ack_range_count):
+        end -= buf.pull_uint_var() + 2
+        ack_count = buf.pull_uint_var()
+        rangeset.add(end - ack_count, end + 1)
+        end -= ack_count
+    return path_id, rangeset, delay

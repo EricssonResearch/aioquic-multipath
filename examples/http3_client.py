@@ -600,5 +600,6 @@ if __name__ == "__main__":
             output_dir=args.output_dir,
             local_port=args.local_port,
             zero_rtt=args.zero_rtt,
+            #max_path_id=1, #to enable multipath
         )
     )

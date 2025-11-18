@@ -48,6 +48,7 @@ from .packet import (
     get_spin_bit,
     pretty_protocol_version,
     pull_ack_frame,
+    pull_path_ack_frame,
     pull_quic_header,
     pull_quic_transport_parameters,
     push_ack_frame,
@@ -92,7 +93,7 @@ MAX_PENDING_CRYPTO = 524288  # in bytes
 
 NetworkAddress = Any
 
-# frame sizes
+# frame sizes single path QUIC
 ACK_FRAME_CAPACITY = 64  # FIXME: this is arbitrary!
 APPLICATION_CLOSE_FRAME_CAPACITY = 1 + 2 * UINT_VAR_MAX_SIZE  # + reason length
 CONNECTION_LIMIT_FRAME_CAPACITY = 1 + UINT_VAR_MAX_SIZE
@@ -109,6 +110,17 @@ RETIRE_CONNECTION_ID_CAPACITY = 1 + UINT_VAR_MAX_SIZE
 STOP_SENDING_FRAME_CAPACITY = 1 + 2 * UINT_VAR_MAX_SIZE
 STREAMS_BLOCKED_CAPACITY = 1 + UINT_VAR_MAX_SIZE
 TRANSPORT_CLOSE_FRAME_CAPACITY = 1 + 3 * UINT_VAR_MAX_SIZE  # + reason length
+
+# frame sizes multipath QUIC
+MAX_PATH_ID_FRAME_CAPACITY = 4 + 1 * UINT_VAR_MAX_SIZE
+PATH_ACK_FRAME_CAPACITY = 64  # FIXME: this is arbitrary!
+PATH_NEW_CONNECTIION_ID_FRAME_CAPACITY = 4 + 3 * UINT_VAR_MAX_SIZE + 1 + 20 + 16
+PATH_RETIRE_CONNECTION_ID_FRAME_CAPACITY = 4 + 2 * UINT_VAR_MAX_SIZE
+PATH_ABANDON_FRAME_CAPACITY = 4 + 3 * UINT_VAR_MAX_SIZE # + reason length # FIXME: adapt when types are standardized / fixed
+PATH_AVAILABLE_FRAME_CAPACITY = 4 + 2 * UINT_VAR_MAX_SIZE
+PATH_BACKUP_FRAME_CAPACITY = 4 + 2 * UINT_VAR_MAX_SIZE
+PATHS_BLOCKED_CAPACITY = 4 + UINT_VAR_MAX_SIZE
+PATH_CIDS_BLOCKED_CAPACITY = 4 + 2 * UINT_VAR_MAX_SIZE
 
 
 def EPOCHS(shortcut: str) -> FrozenSet[tls.Epoch]:
@@ -281,6 +293,7 @@ class QuicConnection:
         self._events: Deque[events.QuicEvent] = deque()
         self._handshake_complete = False
         self._handshake_confirmed = False
+        self._multipath_negotiated = False
         self._local_ack_delay_exponent = 3
         self._local_active_connection_id_limit = 8
         self._local_max_data = Limit(
@@ -303,6 +316,7 @@ class QuicConnection:
         self._local_next_stream_id_uni = 2 if self._is_client else 3
         self._max_ack_delay = 0.025
         self._max_datagram_size = configuration.max_datagram_size
+        self._max_path_id = configuration.max_path_id
         self._network_paths: Dict[int, QuicNetworkPath] = {}
         self._path_ids: Dict[bytes, int] = {}
         self._peer_token = configuration.token
@@ -319,6 +333,7 @@ class QuicConnection:
         self._remote_max_stream_data_uni = 0
         self._remote_max_streams_bidi = 0
         self._remote_max_streams_uni = 0
+        self._remote_max_path_id = None
         self._remote_version_information: Optional[QuicVersionInformation] = None
         self._retry_count = 0
         self._retry_source_connection_id = retry_source_connection_id
@@ -359,6 +374,11 @@ class QuicConnection:
         self._ping_pending: List[int] = []
         self._probe_pending = False
         self._streams_blocked_pending = False
+        self._max_path_id_pending: Dict[int, int] = {} # max_path_id: tx_path_id
+        self._path_abandon: Dict[int, int] = {} # path_id: tx_path_id
+        self._set_paths_to_available: Dict[int, int] = {} # path_id: tx_path_id
+        self._set_paths_to_standby: Dict[int, int] = {} # path_id: tx_path_id
+
 
         # callbacks
         self._session_ticket_fetcher = session_ticket_fetcher
@@ -400,6 +420,9 @@ class QuicConnection:
             0x1E: (self._handle_handshake_done_frame, EPOCHS("1")),
             0x30: (self._handle_datagram_frame, EPOCHS("01")),
             0x31: (self._handle_datagram_frame, EPOCHS("01")),
+            0x15228c00: (self._handle_path_ack_frame, EPOCHS("1")),
+            0x15228c01: (self._handle_path_ack_frame, EPOCHS("1")),
+
         }
 
     @property
@@ -1621,6 +1644,48 @@ class QuicConnection:
             now=context.time,
             space=network_path.spaces[context.epoch],
         )
+        
+
+    def _handle_path_ack_frame(
+        self, context: QuicReceiveContext, frame_type: int, buf: Buffer
+    ) -> None:
+        """
+        Handle an PATH_ACK frame.
+        """
+        path_id, ack_rangeset, ack_delay_encoded = pull_path_ack_frame(buf)
+        if frame_type == QuicFrameType.PATH_ACK_ECN:
+            buf.pull_uint_var()
+            buf.pull_uint_var()
+            buf.pull_uint_var()
+        ack_delay = (ack_delay_encoded << self._remote_ack_delay_exponent) / 1000000
+
+        # validate path_id
+        if path_id not in self._network_paths:
+            self._logger.info(f"Discard PATH_ACK frame for unknown path id {path_id}.")
+            return
+        
+        # log frame
+        if self._quic_logger is not None:
+            context.quic_logger_frames.append(
+                self._quic_logger.encode_path_ack_frame(
+                    ack_rangeset,
+                    ack_delay,
+                    path_id,
+                    self._quic_paths[path_id].host_cid.cid
+                )
+            )
+
+        any_is_non_probing = self._network_paths[path_id].loss.on_ack_received(
+            ack_rangeset=ack_rangeset,
+            ack_delay=ack_delay,
+            now=context.time,
+            space=ONE_RTT, # PATH_ACK_FRAME can only be in 1-RTT - But need to check somewhere?
+        )
+
+        # update idle timeout
+        if any_is_non_probing:
+            self._network_paths[path_id].close_at = context.time + min(self._configuration.idle_timeout, self._remote_max_idle_timeout)
+
 
     def _handle_connection_close_frame(
         self, context: QuicReceiveContext, frame_type: int, buf: Buffer
@@ -2687,7 +2752,9 @@ class QuicConnection:
         self._probe_pending = True
 
     def _parse_transport_parameters(
-        self, data: bytes, from_session_ticket: bool = False
+        self,
+        data: bytes,
+        from_session_ticket: bool = False
     ) -> None:
         """
         Parse and apply remote transport parameters.
@@ -2799,6 +2866,27 @@ class QuicConnection:
                         f"max_udp_payload_size must be >= {SMALLEST_MAX_DATAGRAM_SIZE}"
                     ),
                 )
+            if (
+                quic_transport_parameters.initial_max_path_id is not None
+                and quic_transport_parameters.initial_max_path_id > 2**32-1
+            ):
+                raise QuicConnectionError(
+                    error_code=QuicErrorCode.TRANSPORT_PARAMETER_ERROR,
+                    frame_type=QuicFrameType.CRYPTO,
+                    reason_phrase="initial_max_path_id must be <= 2^32-1",
+                )
+            # todo: check somwehere lese if not zero length CID and disable multipath otherwise
+            #if (
+            #    quic_transport_parameters.initial_max_path_id is not None
+            #    and len(context.host_cid) == 0 # todo: verify, this comparison is valid
+            #):
+            #    raise QuicConnectionError(
+            #        error_code=QuicErrorCode.PROTOCOL_VIOLATION,
+            #        frame_type=QuicFrameType.CRYPTO,
+            #        reason_phrase="Zero-length CIDs are not allowed \
+            #            with initial_max_path_id transport parameter"
+            #    )
+
 
             # Validate Version Information extension.
             #
@@ -2862,9 +2950,16 @@ class QuicConnection:
             self._remote_max_idle_timeout = (
                 quic_transport_parameters.max_idle_timeout / 1000.0
             )
+        if quic_transport_parameters.initial_max_path_id is not None:
+            if self._remote_max_path_id is not None:
+                self._remote_max_path_id = (
+                    quic_transport_parameters.initial_max_path_id
+                )
+                self._multipath_negotiated = True
         self._remote_max_datagram_frame_size = (
             quic_transport_parameters.max_datagram_frame_size
         )
+
         for param in [
             "max_data",
             "max_stream_data_bidi_local",
@@ -2890,6 +2985,7 @@ class QuicConnection:
             initial_max_stream_data_uni=self._local_max_stream_data_uni,
             initial_max_streams_bidi=self._local_max_streams_bidi.value,
             initial_max_streams_uni=self._local_max_streams_uni.value,
+            initial_max_path_id=self._max_path_id,
             initial_source_connection_id=self._local_initial_source_connection_id,
             max_ack_delay=25,
             max_datagram_frame_size=self._configuration.max_datagram_frame_size,
@@ -3038,7 +3134,20 @@ class QuicConnection:
             if self._handshake_complete:
                 # ACK
                 if space.ack_at is not None and space.ack_at <= now:
-                    self._write_ack_frame(builder=builder, space=space, now=now)
+                #    self._write_ack_frame(builder=builder, space=space, now=now)
+                    
+                # Do we need to check: network_path.is_validated
+                #    and is_current_network_path
+                #    and quic_path.state not in PATH_END_STATES
+                    if self._multipath_negotiated:
+                        self._write_path_ack_frame(
+                            builder=builder,
+                            space=space,
+                            now=now,
+                            ack_path_id=ack_path_id
+                        )
+                    else:
+                        self._write_ack_frame(builder=builder, space=space, now=now)
 
                 # HANDSHAKE_DONE
                 if self._handshake_done_pending:
@@ -3252,6 +3361,44 @@ class QuicConnection:
         # check if we need to trigger an ACK-of-ACK
         if ranges > 1 and builder.packet_number % 8 == 0:
             self._write_ping_frame(builder, comment="ACK-of-ACK trigger")
+    
+    
+    def _write_path_ack_frame(
+        self, builder: QuicPacketBuilder, space: QuicPacketSpace, now: float, ack_path_id: int
+    ) -> None:
+        # calculate ACK delay
+        ack_delay = now - space.largest_received_time
+        ack_delay_encoded = int(ack_delay * 1000000) >> self._local_ack_delay_exponent
+
+        buf = builder.start_frame(
+            QuicFrameType.PATH_ACK,
+            capacity=PATH_ACK_FRAME_CAPACITY,
+            handler=self._on_ack_delivery,
+            handler_args=(space, space.largest_received_packet),
+        )
+        
+        # add path id to frame
+        buf.push_uint_var(ack_path_id)
+        # add ack ranges and delay to frame
+        ranges = push_ack_frame(buf, space.ack_queue, ack_delay_encoded)
+        
+        space.ack_at = None
+
+        # log frame
+        if self._quic_logger is not None:
+            builder.quic_logger_frames.append(
+                self._quic_logger.encode_path_ack_frame(
+                    ranges=space.ack_queue,
+                    delay=ack_delay,
+                    path_id=ack_path_id,
+                    cid=self._quic_paths[ack_path_id].peer_cid.cid
+                )
+            )
+
+        # check if we need to trigger an ACK-of-ACK
+        if ranges > 1 and builder.packet_number % 8 == 0:
+            self._write_ping_frame(builder, comment="ACK-of-ACK trigger")
+
 
     def _write_connection_close_frame(
         self,
