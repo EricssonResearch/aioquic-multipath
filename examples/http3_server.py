@@ -599,7 +599,7 @@ if __name__ == "__main__":
         max_datagram_size=args.max_datagram_size,
         quic_logger=quic_logger,
         secrets_log_file=secrets_log_file,
-        #max_path_id=1, #to enable multipath
+        max_path_id=1, #to enable multipath
     )
 
     # load SSL certificate and key
