@@ -2472,7 +2472,7 @@ class QuicConnection:
         self, delivery: QuicDeliveryState, connection_id: QuicConnectionId
     ) -> None:
         """
-        Callback when a NEW_CONNECTION_ID frame is acknowledged or lost.
+        Callback when a NEW_CONNECTION_ID or PATH_NEW_CONNECTION_ID frame is acknowledged or lost.
         """
         if delivery != QuicDeliveryState.ACKED:
             connection_id.was_sent = False
@@ -3177,12 +3177,21 @@ class QuicConnection:
                         builder=builder, challenge=challenge
                     )
 
-                # NEW_CONNECTION_ID
-                for connection_id in network_path.host_cids:
-                    if not connection_id.was_sent:
-                        self._write_new_connection_id_frame(
-                            builder=builder, connection_id=connection_id
-                        )
+                # NEW_CONNECTION_ID current path
+                if network_path.active_path_tuple.is_validated:
+                    for np in self._network_paths.values():
+                        for connection_id in np.host_cids:
+                            if not connection_id.was_sent:
+                                if self._multipath_negotiated:
+                                    self._write_path_new_connection_id_frame(
+                                        builder=builder, 
+                                        connection_id=connection_id, 
+                                        path_id=np.path_id
+                                    )
+                                else:
+                                    self._write_new_connection_id_frame(
+                                        builder=builder, connection_id=connection_id
+                                    )
 
                 # RETIRE_CONNECTION_ID
                 for sequence_number in network_path.retire_connection_ids[:]:
@@ -3403,7 +3412,39 @@ class QuicConnection:
         # check if we need to trigger an ACK-of-ACK
         if ranges > 1 and builder.packet_number % 8 == 0:
             self._write_ping_frame(builder, comment="ACK-of-ACK trigger")
+    
+    def _write_path_new_connection_id_frame(
+        self, builder: QuicPacketBuilder, connection_id: QuicConnectionId, path_id: int
+    ) -> None:
+        retire_prior_to = 0  # FIXME
 
+        buf = builder.start_frame(
+            QuicFrameType.PATH_NEW_CONNECTIION_ID,
+            capacity=PATH_NEW_CONNECTIION_ID_FRAME_CAPACITY,
+            handler=self._on_new_connection_id_delivery,
+            handler_args=(connection_id,),
+        )
+        buf.push_uint_var(path_id)
+        buf.push_uint_var(connection_id.sequence_number)
+        buf.push_uint_var(retire_prior_to)
+        buf.push_uint8(len(connection_id.cid))
+        buf.push_bytes(connection_id.cid)
+        buf.push_bytes(connection_id.stateless_reset_token)
+
+        connection_id.was_sent = True
+        self._events.append(events.ConnectionIdIssued(connection_id=connection_id.cid))
+
+        # log frame
+        if self._quic_logger is not None:
+            builder.quic_logger_frames.append(
+                self._quic_logger.encode_path_new_connection_id_frame(
+                    path_id=path_id,
+                    connection_id=connection_id.cid,
+                    retire_prior_to=retire_prior_to,
+                    sequence_number=connection_id.sequence_number,
+                    stateless_reset_token=connection_id.stateless_reset_token,
+                )
+            )
 
     def _write_connection_close_frame(
         self,
