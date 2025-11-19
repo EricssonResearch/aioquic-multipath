@@ -148,6 +148,24 @@ class QuicLoggerTrace:
 
     def encode_path_response_frame(self, data: bytes) -> Dict:
         return {"data": hexdump(data), "frame_type": "path_response"}
+    
+    def encode_path_new_connection_id_frame(
+        self,
+        path_id: int,
+        connection_id: bytes,
+        retire_prior_to: int,
+        sequence_number: int,
+        stateless_reset_token: bytes,
+    ) -> Dict:
+        return {
+            "path_id": path_id,
+            "connection_id": hexdump(connection_id),
+            "frame_type": "path_new_connection_id",
+            "length": len(connection_id),
+            "reset_token": hexdump(stateless_reset_token),
+            "retire_prior_to": retire_prior_to,
+            "sequence_number": sequence_number,
+        }
 
     def encode_ping_frame(self) -> Dict:
         return {"frame_type": "ping"}
