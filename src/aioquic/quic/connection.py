@@ -315,6 +315,7 @@ class QuicConnection:
         self._max_datagram_size = configuration.max_datagram_size
         self._max_path_id = configuration.max_path_id
         self._network_paths: Dict[int, QuicNetworkPath] = {}
+        self._network_paths_stock: Dict[int, QuicNetworkPath] = {}
         self._path_ids: Dict[bytes, int] = {}
         self._peer_token = configuration.token
         self._quic_logger: Optional[QuicLoggerTrace] = None
@@ -419,6 +420,7 @@ class QuicConnection:
             0x31: (self._handle_datagram_frame, EPOCHS("01")),
             0x15228c00: (self._handle_path_ack_frame, EPOCHS("1")),
             0x15228c01: (self._handle_path_ack_frame, EPOCHS("1")),
+            0x15228c09: (self._handle_path_new_connection_id_frame, EPOCHS("1")),
 
         }
 
@@ -1317,10 +1319,17 @@ class QuicConnection:
     def _create_network_path(
             self, 
             path_id: int, 
-            host_cid: QuicConnectionId, 
-            peer_cid: QuicConnectionId, 
-            path_tuple: PathTuple,
+            host_cid: Optional[QuicConnectionId], 
+            peer_cid: Optional[QuicConnectionId], 
+            path_tuple: Optional[PathTuple],
+            stock: bool = False,
         ) -> None:
+        if not stock:
+            assert (
+                host_cid is not None
+                and peer_cid is not None
+                and path_tuple is not None
+            ), "host_cid, peer_cid, and path_tuple must not be None for non-stock case"
         loss = QuicPacketRecovery(
             congestion_control_algorithm=self._configuration.congestion_control_algorithm,
             initial_rtt=self._configuration.initial_rtt,
@@ -1338,7 +1347,10 @@ class QuicConnection:
             peer_cid=peer_cid,
             loss=loss,
         )
-        self._network_paths[path_id] = network_path
+        if stock:
+            self._network_paths_stock[path_id] = network_path
+        else:
+            self._network_paths[path_id] = network_path
 
     #def _find_network_path(self, destination_cid: bytes) -> QuicNetworkPath:
     def _find_network_path(self, remote_addr: NetworkAddress, local_addr: NetworkAddress,) -> QuicNetworkPath:
@@ -1671,7 +1683,7 @@ class QuicConnection:
                     ack_rangeset,
                     ack_delay,
                     path_id,
-                    self._quic_paths[path_id].host_cid.cid
+                    self._network_paths[path_id].host_cid
                 )
             )
 
@@ -1679,7 +1691,7 @@ class QuicConnection:
             ack_rangeset=ack_rangeset,
             ack_delay=ack_delay,
             now=context.time,
-            space=QuicPacketType.ONE_RTT, # PATH_ACK_FRAME can only be in 1-RTT - But need to check somewhere?
+            space=self._network_paths[path_id].spaces[tls.Epoch.ONE_RTT], # PATH_ACK_FRAME can only be in 1-RTT
         )
 
         # update idle timeout
@@ -1996,6 +2008,150 @@ class QuicConnection:
             self._logger.debug("Remote max_streams_uni raised to %d", max_streams)
             self._remote_max_streams_uni = max_streams
             self._unblock_streams(is_unidirectional=True)
+
+    def _handle_path_new_connection_id_frame(
+        self, context: QuicReceiveContext, frame_type: int, buf: Buffer
+    ) -> None:
+        """
+        Handle a PATH_NEW_CONNECTIION_ID frame.
+        """
+        path_id = buf.pull_uint_var()
+        sequence_number = buf.pull_uint_var()
+        retire_prior_to = buf.pull_uint_var()
+        length = buf.pull_uint8()
+        connection_id = buf.pull_bytes(length)
+        stateless_reset_token = buf.pull_bytes(STATELESS_RESET_TOKEN_SIZE)
+        if not connection_id or len(connection_id) > CONNECTION_ID_MAX_SIZE:
+            raise QuicConnectionError(
+                error_code=QuicErrorCode.FRAME_ENCODING_ERROR,
+                frame_type=frame_type,
+                reason_phrase="Length must be greater than 0 and less than 20",
+            )
+
+        # log frame
+        if self._quic_logger is not None:
+            context.quic_logger_frames.append(
+                self._quic_logger.encode_path_new_connection_id_frame(
+                    path_id=path_id,
+                    connection_id=connection_id,
+                    retire_prior_to=retire_prior_to,
+                    sequence_number=sequence_number,
+                    stateless_reset_token=stateless_reset_token,
+                )
+            )
+
+        # sanity check
+        if retire_prior_to > sequence_number:
+            raise QuicConnectionError(
+                error_code=QuicErrorCode.PROTOCOL_VIOLATION,
+                frame_type=frame_type,
+                reason_phrase="Retire Prior To is greater than Sequence Number",
+            )
+        if path_id > self._max_path_id:
+            raise QuicConnectionError(
+                error_code=QuicErrorCode.PROTOCOL_VIOLATION,
+                frame_type=frame_type,
+                reason_phrase="invalid path id",
+            )
+
+        if path_id in self._network_paths:
+            record_path_id = self._network_paths[path_id].handle_new_connection_id_frame(
+                sequence_number, retire_prior_to, connection_id, stateless_reset_token
+            )
+
+            if record_path_id:
+                self._path_ids[connection_id] = path_id
+
+            if 1 + len(self._network_paths[path_id].peer_cid_available) > self._local_active_connection_id_limit:
+                raise QuicConnectionError(
+                    error_code=QuicErrorCode.CONNECTION_ID_LIMIT_ERROR,
+                    frame_type=frame_type,
+                    reason_phrase="Too many active connection IDs",
+                )
+            
+            # Check the number of retired connection IDs pending, though with a safer limit
+            # than the 2x recommended in section 5.1.2 of the RFC.  Note that we are doing
+            # the check here and not in QuicNetworkPath.retire_peer_cid() because we know the frame type
+            # to use here, and because it is the new connection id path that is potentially
+            # dangerous.  We may transiently go a bit over the limit due to unacked frames
+            # getting added back to the list, but that's ok as it is bounded.
+            if len(self._network_paths[path_id].retire_connection_ids) > min(
+                self._local_active_connection_id_limit * 4, MAX_PENDING_RETIRES
+            ):
+                raise QuicConnectionError(
+                    error_code=QuicErrorCode.CONNECTION_ID_LIMIT_ERROR,
+                    frame_type=frame_type,
+                    reason_phrase="Too many pending retired connection IDs",
+                )
+
+        elif path_id in self._network_paths_stock:
+            record_path_id = self._network_paths_stock[path_id].handle_new_connection_id_frame(
+                sequence_number, retire_prior_to, connection_id, stateless_reset_token
+            )
+
+            if record_path_id:
+                self._path_ids[connection_id] = path_id
+
+            if 1 + len(self._network_paths_stock[path_id].peer_cid_available) > self._local_active_connection_id_limit:
+                raise QuicConnectionError(
+                    error_code=QuicErrorCode.CONNECTION_ID_LIMIT_ERROR,
+                    frame_type=frame_type,
+                    reason_phrase="Too many active connection IDs",
+                )
+
+            # Check the number of retired connection IDs pending, though with a safer limit
+            # than the 2x recommended in section 5.1.2 of the RFC.  Note that we are doing
+            # the check here and not in QuicNetworkPath.retire_peer_cid() because we know the frame type
+            # to use here, and because it is the new connection id path that is potentially
+            # dangerous.  We may transiently go a bit over the limit due to unacked frames
+            # getting added back to the list, but that's ok as it is bounded.
+            if len(self._network_paths_stock[path_id].retire_connection_ids) > min(
+                self._local_active_connection_id_limit * 4, MAX_PENDING_RETIRES
+            ):
+                raise QuicConnectionError(
+                    error_code=QuicErrorCode.CONNECTION_ID_LIMIT_ERROR,
+                    frame_type=frame_type,
+                    reason_phrase="Too many pending retired connection IDs",
+                )
+
+        else:
+            # path_id is not in stock, so we add it
+            self._create_network_path(
+                path_id=path_id, 
+                host_cid=None,
+                peer_cid=None,
+                path_tuple=None,
+                stock=True,
+            )
+
+            record_path_id = self._network_paths_stock[path_id].handle_new_connection_id_frame(
+                sequence_number, retire_prior_to, connection_id, stateless_reset_token
+            )
+
+            if record_path_id:
+                self._path_ids[connection_id] = path_id
+
+            if 1 + len(self._network_paths_stock[path_id].peer_cid_available) > self._local_active_connection_id_limit:
+                raise QuicConnectionError(
+                    error_code=QuicErrorCode.CONNECTION_ID_LIMIT_ERROR,
+                    frame_type=frame_type,
+                    reason_phrase="Too many active connection IDs",
+                )
+            
+            # Check the number of retired connection IDs pending, though with a safer limit
+            # than the 2x recommended in section 5.1.2 of the RFC.  Note that we are doing
+            # the check here and not in QuicNetworkPath.retire_peer_cid() because we know the frame type
+            # to use here, and because it is the new connection id path that is potentially
+            # dangerous.  We may transiently go a bit over the limit due to unacked frames
+            # getting added back to the list, but that's ok as it is bounded.
+            if len(self._network_paths_stock[path_id].retire_connection_ids) > min(
+                self._local_active_connection_id_limit * 4, MAX_PENDING_RETIRES
+            ):
+                raise QuicConnectionError(
+                    error_code=QuicErrorCode.CONNECTION_ID_LIMIT_ERROR,
+                    frame_type=frame_type,
+                    reason_phrase="Too many pending retired connection IDs",
+                )
 
     def _handle_new_connection_id_frame(
         self, context: QuicReceiveContext, frame_type: int, buf: Buffer
@@ -2956,7 +3112,7 @@ class QuicConnection:
                 quic_transport_parameters.max_idle_timeout / 1000.0
             )
         if quic_transport_parameters.initial_max_path_id is not None:
-            if self._remote_max_path_id is not None:
+            if self._max_path_id is not None:
                 self._remote_max_path_id = (
                     quic_transport_parameters.initial_max_path_id
                 )
@@ -3405,7 +3561,7 @@ class QuicConnection:
                     ranges=space.ack_queue,
                     delay=ack_delay,
                     path_id=ack_path_id,
-                    cid=self._quic_paths[ack_path_id].peer_cid.cid
+                    cid=self._network_paths[ack_path_id].peer_cid.cid
                 )
             )
 

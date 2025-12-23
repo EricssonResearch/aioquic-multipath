@@ -53,19 +53,20 @@ class QuicNetworkPath:
     def __init__(
         self,
         path_id: int,
-        path_tuple: PathTuple,
-        host_cid: QuicConnectionId,
-        peer_cid: QuicConnectionId,
+        path_tuple: Optional[PathTuple],
+        host_cid: Optional[QuicConnectionId],
+        peer_cid: Optional[QuicConnectionId],
         loss: QuicPacketRecovery,
         logger: Optional[logging.LoggerAdapter] = None,
     ):
+        # host_cid, peer_cid, and path_tuple can be None for paths in stock only.
         self.path_id: int = path_id
-        self.host_cid = host_cid.cid
-        self.host_cids: List[QuicConnectionId] = [host_cid]
+        self.host_cid: bytes = b''
+        self.host_cids: List[QuicConnectionId] = []
         self.host_cid_seq: int = 1
-        self.peer_cid: QuicConnectionId = peer_cid
-        self.path_tuples: List[PathTuple] = [path_tuple]
-        self.active_path_tuple: PathTuple = path_tuple
+        self.peer_cid: Optional[QuicConnectionId] = None
+        self.path_tuples: List[PathTuple] = []
+        self.active_path_tuple: Optional[PathTuple] = path_tuple
         self.pacing_at: Optional[float] = None
         self.packet_number: int = 0
         self.peer_cid_available: List[QuicConnectionId] = []
@@ -79,6 +80,14 @@ class QuicNetworkPath:
 
         # things to send
         self.retire_connection_ids: List[int] = []
+
+        if host_cid is not None:
+            self.host_cid = host_cid.cid
+            self.host_cids = [host_cid]
+        if peer_cid is not None:
+            self.peer_cid = peer_cid
+        if path_tuple is not None:
+            self.path_tuples: List[PathTuple] = [path_tuple]
 
         
     def change_connection_id(self) -> None:
