@@ -1,7 +1,7 @@
 import asyncio
 import os
 from functools import partial
-from typing import Callable, Dict, Optional, Text, Union, cast, List
+from typing import Callable, Dict, Optional, Text, Tuple, Union, cast, List
 
 from ..buffer import Buffer
 from ..quic.configuration import SMALLEST_MAX_DATAGRAM_SIZE, QuicConfiguration
@@ -205,6 +205,7 @@ async def serve(
     session_ticket_handler: Optional[SessionTicketHandler] = None,
     retry: bool = False,
     stream_handler: QuicStreamHandler = None,
+    additional_interfaces: Optional[List[Tuple[str, int]]] = None,
 ) -> QuicServer:
     """
     Start a QUIC server at the given `host` and `port`.
@@ -257,8 +258,9 @@ async def serve(
     )
     await protocol.add_datagram_endpoint(host, port)
 
-    #if not host2host == None and not host2port == None:
-    #    await protocol.add_datagram_endpoint(host2host, host2port)
+    if additional_interfaces:
+        for if_host, if_port in additional_interfaces:
+            await protocol.add_datagram_endpoint(if_host, if_port)
     
     return cast(QuicServer, protocol)
 

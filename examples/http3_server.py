@@ -5,7 +5,7 @@ import logging
 import time
 from collections import deque
 from email.utils import formatdate
-from typing import Callable, Deque, Dict, List, Optional, Union, cast
+from typing import Callable, Deque, Dict, List, Optional, Union, Tuple, cast
 
 import aioquic
 import wsproto
@@ -486,6 +486,7 @@ async def main(
     configuration: QuicConfiguration,
     session_ticket_store: SessionTicketStore,
     retry: bool,
+    additional_interfaces: Optional[List[Tuple[str, int]]] = None,
 ) -> None:
     await serve(
         host,
@@ -495,6 +496,7 @@ async def main(
         session_ticket_fetcher=session_ticket_store.pop,
         session_ticket_handler=session_ticket_store.add,
         retry=retry,
+        additional_interfaces=additional_interfaces,
     )
     await asyncio.Future()
 
@@ -509,6 +511,13 @@ if __name__ == "__main__":
         nargs="?",
         default="demo:app",
         help="the ASGI application as <module>:<attribute>",
+    )
+    parser.add_argument(
+        "--additional-interface",
+        type=str,
+        action="append",
+        default=[],
+        help="additional listen address as host:port (can be repeated)",
     )
     parser.add_argument(
         "-c",
@@ -590,6 +599,14 @@ if __name__ == "__main__":
         secrets_log_file = open(args.secrets_log, "a")
     else:
         secrets_log_file = None
+    
+    additional_interfaces = []
+    for interface in args.additional_interface:
+        parts = interface.rsplit(":", 1)
+        if len(parts) != 2 or not parts[1].isdigit():
+            logging.warning("Ignoring malformed interface: %s", interface)
+            continue
+        additional_interfaces.append((parts[0], int(parts[1])))
 
     configuration = QuicConfiguration(
         alpn_protocols=H3_ALPN + H0_ALPN + ["siduck"],
@@ -616,6 +633,7 @@ if __name__ == "__main__":
                 configuration=configuration,
                 session_ticket_store=SessionTicketStore(),
                 retry=args.retry,
+                additional_interfaces=additional_interfaces or None,
             )
         )
     except KeyboardInterrupt:
