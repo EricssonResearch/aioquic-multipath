@@ -1798,6 +1798,10 @@ class QuicConnection:
                     self._discard_epoch(tls.Epoch.HANDSHAKE, context.path_id)
                     self._handshake_confirmed = True
                     self._handshake_done_pending = True
+                    
+                    # prepare additional paths for multipath
+                    if self._multipath_negotiated:
+                        self._setup_paths_in_stock()
 
                 self._replenish_connection_ids(context.path_id)
                 self._events.append(
@@ -1898,7 +1902,7 @@ class QuicConnection:
             self._handshake_confirmed = True
             self._network_paths[context.path_id].loss.peer_completed_address_validation = True
         
-        # in case of multipath prepare additional paths
+        # prepare additional paths for multipath
         if self._multipath_negotiated:
             self._setup_paths_in_stock()
 
