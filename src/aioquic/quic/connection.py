@@ -1897,6 +1897,10 @@ class QuicConnection:
             self._discard_epoch(tls.Epoch.HANDSHAKE, context.path_id)
             self._handshake_confirmed = True
             self._network_paths[context.path_id].loss.peer_completed_address_validation = True
+        
+        # in case of multipath prepare additional paths
+        if self._multipath_negotiated:
+            self._setup_paths_in_stock()
 
     def _handle_max_data_frame(
         self, context: QuicReceiveContext, frame_type: int, buf: Buffer
@@ -2092,7 +2096,7 @@ class QuicConnection:
             if record_path_id:
                 self._path_ids[connection_id] = path_id
 
-            if 1 + len(self._network_paths_stock[path_id].peer_cid_available) > self._local_active_connection_id_limit:
+            if len(self._network_paths_stock[path_id].peer_cid_available) > self._local_active_connection_id_limit:
                 raise QuicConnectionError(
                     error_code=QuicErrorCode.CONNECTION_ID_LIMIT_ERROR,
                     frame_type=frame_type,
@@ -2131,7 +2135,7 @@ class QuicConnection:
             if record_path_id:
                 self._path_ids[connection_id] = path_id
 
-            if 1 + len(self._network_paths_stock[path_id].peer_cid_available) > self._local_active_connection_id_limit:
+            if len(self._network_paths_stock[path_id].peer_cid_available) > self._local_active_connection_id_limit:
                 raise QuicConnectionError(
                     error_code=QuicErrorCode.CONNECTION_ID_LIMIT_ERROR,
                     frame_type=frame_type,
@@ -2894,7 +2898,12 @@ class QuicConnection:
         """
         Generate new connection IDs.
         """
-        network_path = self._network_paths[path_id]
+        assert path_id in self._network_paths or path_id in self._network_paths_stock, "unknown path ID"
+        if path_id in self._network_paths:
+            network_path = self._network_paths[path_id]
+        else:
+            network_path = self._network_paths_stock[path_id]
+
         cids = network_path.replenish_connection_ids(
             connection_id_length = self._configuration.connection_id_length, 
             remote_active_connection_id_limit = self._remote_active_connection_id_limit,
@@ -3187,6 +3196,15 @@ class QuicConnection:
         self._logger.debug("%s -> %s", self._state, state)
         self._state = state
 
+    def _setup_paths_in_stock(self):
+        max_path_id = min(self._max_path_id, self._remote_max_path_id)
+        for path_id in range(max_path_id+1):
+            if path_id not in self._network_paths and path_id not in self._network_paths_stock:
+                self._create_network_path(
+                    path_id=path_id, host_cid=None, peer_cid=None, path_tuple=None, stock=True
+                )
+                self._replenish_connection_ids(path_id)
+
     def _stream_can_receive(self, stream_id: int) -> bool:
         return stream_is_client_initiated(
             stream_id
@@ -3333,7 +3351,7 @@ class QuicConnection:
                         builder=builder, challenge=challenge
                     )
 
-                # NEW_CONNECTION_ID current path
+                # NEW_CONNECTION_ID active path
                 if network_path.active_path_tuple.is_validated:
                     for np in self._network_paths.values():
                         for connection_id in np.host_cids:
@@ -3348,6 +3366,18 @@ class QuicConnection:
                                     self._write_new_connection_id_frame(
                                         builder=builder, connection_id=connection_id
                                     )
+
+                # NEW_CONNECTION_ID paths in stock
+                if network_path.active_path_tuple.is_validated:
+                    for np in self._network_paths_stock.values():
+                        for connection_id in np.host_cids:
+                            if not connection_id.was_sent:
+                                assert self._multipath_negotiated, "network paths in stock can only be used with multipath"
+                                self._write_path_new_connection_id_frame(
+                                    builder=builder, 
+                                    connection_id=connection_id, 
+                                    path_id=np.path_id
+                                )
 
                 # RETIRE_CONNECTION_ID
                 for sequence_number in network_path.retire_connection_ids[:]:

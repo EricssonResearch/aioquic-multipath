@@ -70,7 +70,7 @@ class QuicNetworkPath:
         self.pacing_at: Optional[float] = None
         self.packet_number: int = 0
         self.peer_cid_available: List[QuicConnectionId] = []
-        self.peer_cid_sequence_numbers: Set[int] = set([0])
+        self.peer_cid_sequence_numbers: Set[int] = set()
         self.peer_retire_prior_to = 0
         self.loss = loss
         self.loss_at: Optional[float] = None
@@ -86,6 +86,7 @@ class QuicNetworkPath:
             self.host_cids = [host_cid]
         if peer_cid is not None:
             self.peer_cid = peer_cid
+            self.peer_cid_sequence_numbers.add(0)
         if path_tuple is not None:
             self.path_tuples: List[PathTuple] = [path_tuple]
 
@@ -140,7 +141,7 @@ class QuicNetworkPath:
             for cid in self.peer_cid_available
             if cid.sequence_number < self.peer_retire_prior_to
         ]
-        if self.peer_cid.sequence_number < self.peer_retire_prior_to:
+        if self.peer_cid is not None and self.peer_cid.sequence_number < self.peer_retire_prior_to:
             change_cid = True
             retire.insert(0, self.peer_cid)
 
