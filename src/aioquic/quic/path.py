@@ -63,7 +63,7 @@ class QuicNetworkPath:
         self.path_id: int = path_id
         self.host_cid: bytes = b''
         self.host_cids: List[QuicConnectionId] = []
-        self.host_cid_seq: int = 1
+        self.host_cid_seq: int = 0
         self.peer_cid: Optional[QuicConnectionId] = None
         self.path_tuples: List[PathTuple] = []
         self.active_path_tuple: Optional[PathTuple] = path_tuple
@@ -84,6 +84,7 @@ class QuicNetworkPath:
         if host_cid is not None:
             self.host_cid = host_cid.cid
             self.host_cids = [host_cid]
+            self.host_cid_seq = 1
         if peer_cid is not None:
             self.peer_cid = peer_cid
             self.peer_cid_sequence_numbers.add(0)
