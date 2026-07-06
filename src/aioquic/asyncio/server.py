@@ -263,7 +263,3 @@ async def serve(
             await protocol.add_datagram_endpoint(if_host, if_port)
     
     return cast(QuicServer, protocol)
-
-    
-    
-    return protocol

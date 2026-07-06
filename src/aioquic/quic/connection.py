@@ -434,6 +434,49 @@ class QuicConnection:
     @property
     def original_destination_connection_id(self) -> bytes:
         return self._original_destination_connection_id
+    
+    def add_unvalidated_path(self, addr_remote: NetworkAddress, addr_local: NetworkAddress) -> bool:
+        """
+        Activate a stock path for use. Returns True if successful.
+        Requires: multipath negotiated, stock path available with CIDs on both sides.
+        """
+        assert self._is_client and self._handshake_complete, (
+            "only client can add an additional path and handshake must be completed"
+        )
+        if not self._multipath_negotiated or not self._handshake_confirmed:
+            return False
+        
+        # find a stock path with CIDs ready
+        for path_id, stock_path in list(self._network_paths_stock.items()):
+            if stock_path.peer_cid_available and stock_path.host_cids:
+                # assign 4-tuple
+                path_tuple = PathTuple(
+                    local_addr=addr_local,
+                    remote_addr=addr_remote,
+                )
+                stock_path.active_path_tuple = path_tuple
+                stock_path.path_tuples = [path_tuple]
+
+                # assign / consume CIDs
+                stock_path.host_cid = stock_path.host_cids[0].cid
+                stock_path.peer_cid = stock_path.peer_cid_available.pop(0)
+
+                # initialize packet number space
+                stock_path.spaces = {
+                    tls.Epoch.ONE_RTT: QuicPacketSpace(),
+                }
+                stock_path.loss.spaces = list(stock_path.spaces.values())
+
+                # promote to active
+                self._network_paths[path_id] = stock_path
+                del self._network_paths_stock[path_id]
+
+                # logging
+                self._logger.info(f"Activate path {path_id} with path tuple {addr_local}, {addr_remote}.")
+
+                return True
+
+        return False
 
     def close(
         self,
@@ -1346,6 +1389,7 @@ class QuicConnection:
             host_cid=host_cid,
             peer_cid=peer_cid,
             loss=loss,
+            logger=self._logger,
         )
         if stock:
             self._network_paths_stock[path_id] = network_path
@@ -1382,6 +1426,7 @@ class QuicConnection:
                     is_validated=True,
                 ),
             )
+            self._replenish_connection_ids(0)
             return self._network_paths[0]
 
         # todo: Further cases of 'destination CID cannot be matched'
@@ -2131,6 +2176,7 @@ class QuicConnection:
                 path_tuple=None,
                 stock=True,
             )
+            self._replenish_connection_ids(path_id)
 
             record_path_id = self._network_paths_stock[path_id].handle_new_connection_id_frame(
                 sequence_number, retire_prior_to, connection_id, stateless_reset_token

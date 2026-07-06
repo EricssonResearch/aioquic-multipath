@@ -82,10 +82,7 @@ async def connect(
         if not completed:
             sock.close()
     # connect
-    transport, protocol = await loop.create_datagram_endpoint(
-        lambda: create_protocol(connection, stream_handler=stream_handler),
-        sock=sock,
-    )
+    protocol = create_protocol(connection, stream_handler=stream_handler)
     protocol = cast(QuicConnectionProtocol, protocol)
     try:
         await protocol.connect(addr, local_addr=(local_host, local_port), transmit=wait_connected)
@@ -95,5 +92,5 @@ async def connect(
     finally:
         protocol.close()
         await protocol.wait_closed()
-        transport.close()
+        protocol.close_all_transports()
 

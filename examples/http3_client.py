@@ -6,7 +6,7 @@ import pickle
 import ssl
 import time
 from collections import deque
-from typing import BinaryIO, Callable, Deque, Dict, List, Optional, Union, cast
+from typing import BinaryIO, Callable, Deque, Dict, List, Optional, Union, Tuple, cast
 from urllib.parse import urlparse
 
 import aioquic
@@ -353,6 +353,7 @@ async def main(
     output_dir: Optional[str],
     local_port: int,
     zero_rtt: bool,
+    additional_paths: Optional[List[Tuple[Optional[str], str, int]]] = None,
 ) -> None:
     # parse URL
     parsed = urlparse(urls[0])
@@ -396,6 +397,15 @@ async def main(
     ) as client:
         client = cast(HttpClient, client)
 
+        for local_host, remote_host, remote_port in (additional_paths or []):
+            addr_local, addr_remote = await client.add_interface(
+                remote_host=remote_host, 
+                remote_port=remote_port,
+                local_host=local_host or "::",
+            )
+            if addr_local is not None:
+                await client.add_path(addr_local, addr_remote)
+
         if parsed.scheme == "wss":
             ws = await client.websocket(urls[0], subprotocols=["chat", "superchat"])
 
@@ -434,6 +444,13 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="HTTP/3 client")
     parser.add_argument(
         "url", type=str, nargs="+", help="the URL to query (must be HTTPS)"
+    )
+    parser.add_argument(
+        "--add-path",
+        type=str,
+        action="append",
+        default=[],
+        help="add a QUIC path as [LOCAL_HOST:]REMOTE_HOST:REMOTE_PORT",
     )
     parser.add_argument(
         "--ca-certs", type=str, help="load CA certificates from the specified file"
@@ -586,6 +603,20 @@ if __name__ == "__main__":
         except FileNotFoundError:
             pass
 
+    additional_paths = []
+    for path in args.add_path:
+        # format: [LOCAL_HOST:]REMOTE_HOST:REMOTE_PORT
+        parts = path.rsplit(":", 2)
+        if len(parts) == 3 and parts[2].isdigit():
+            # LOCAL_HOST:REMOTE_HOST:REMOTE_PORT
+            additional_paths.append((parts[0], parts[1], int(parts[2])))
+        elif len(parts) == 2 and parts[1].isdigit():
+            # REMOTE_HOST:REMOTE_PORT
+            additional_paths.append((None, parts[0], int(parts[1])))
+        else:
+            logging.warning("Ignoring malformed --add-path: %s", path)
+            continue
+
     # load SSL certificate and key
     if args.certificate is not None:
         configuration.load_cert_chain(args.certificate, args.private_key)
@@ -601,5 +632,6 @@ if __name__ == "__main__":
             output_dir=args.output_dir,
             local_port=args.local_port,
             zero_rtt=args.zero_rtt,
+            additional_paths=additional_paths,
         )
     )
