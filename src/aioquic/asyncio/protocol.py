@@ -1,12 +1,25 @@
 import asyncio
+import binascii
+import logging
+import socket
+import sys
 from typing import Any, Callable, List, Optional, Text, Tuple, Union, cast
 
 from ..quic import events
 from ..quic.connection import NetworkAddress, QuicConnection
 from ..quic.packet import QuicErrorCode
 
+logger = logging.getLogger("protocol")
+
 QuicConnectionIdHandler = Callable[[bytes], None]
 QuicStreamHandler = Callable[[asyncio.StreamReader, asyncio.StreamWriter], None]
+
+def dump_cid(cid: bytes) -> str:
+    return binascii.hexlify(cid).decode("ascii")
+
+class QuicConnectionProtocolAdapter(logging.LoggerAdapter):
+    def process(self, msg: str, kwargs: Any) -> Tuple[str, Any]:
+        return "[%s] %s" % (self.extra["id"], msg), kwargs
 
 class ProtocolWrapper(asyncio.DatagramProtocol):
     def __init__(
@@ -77,6 +90,63 @@ class QuicConnectionProtocol(asyncio.DatagramProtocol):
         else:
             self._stream_handler = lambda r, w: None
 
+        # logging
+        self._logger = QuicConnectionProtocolAdapter(
+            logger, {"id": dump_cid(self._quic._original_destination_connection_id)}
+        )
+
+    async def add_path(
+        self,
+        addr_local: Optional[NetworkAddress] = None,
+        addr_remote: Optional[NetworkAddress] = None,
+        retry_cap: int = 5,
+    ) -> bool:
+        # initiate QUIC path creation with retry, e.g., when CID not ready
+        if self._quic._multipath_negotiated: 
+            num_paths = len(self._quic._network_paths) + len(self._quic._network_paths_stock)
+            if self._quic._max_path_id + 1 > num_paths:
+                for _ in range(retry_cap):
+                    if self._quic.add_unvalidated_path(addr_remote, addr_local):
+                        self.transmit()
+                        return True
+                    await asyncio.sleep(0.1)
+        return False
+
+    async def add_interface(
+        self,
+        remote_host: str,
+        remote_port: int,
+        local_host: str = "::",
+    ) -> Tuple[Optional[NetworkAddress], Optional[NetworkAddress]]:
+        """
+        Add a network interface with new UDP socket.
+        Returns actual local address and remote address.
+        Returns (None, None) if creation was not successsful.
+        """
+        # resolve remote address
+        infos = await self._loop.getaddrinfo(
+            remote_host, remote_port, type=socket.SOCK_DGRAM
+        )
+        addr = infos[0][4]
+        if len(addr) == 2:
+            # determine behaviour for IPv4
+            if sys.platform == "win32":
+                # on Windows, we must use an IPv4 socket to reach an IPv4 host
+                local_host = "0.0.0.0"
+            else:
+                # other platforms support dual-stack sockets
+                addr = ("::ffff:" + addr[0], addr[1], 0, 0)
+
+        # create new local transport (UDP socket)
+        try:
+            transport = TransportWrapper((local_host, 0), addr)
+            _transport, _protocol = await transport.create_transport(self._loop, self)
+            self._transports.append(_transport)
+            return transport.local_addr, addr
+        except OSError as e:
+            self._logger.warning("Failed to create interface: %s", e)
+            return None, None
+
     def change_connection_id(self) -> None:
         """
         Change the connection ID used to communicate with the peer.
@@ -104,6 +174,10 @@ class QuicConnectionProtocol(asyncio.DatagramProtocol):
             reason_phrase=reason_phrase,
         )
         self.transmit()
+
+    def close_all_transports(self) -> None:
+        for tp in self._transports:
+            tp._transport.close()
 
     async def connect(self, addr: NetworkAddress, local_addr: NetworkAddress, transmit=True) -> None:
         """
