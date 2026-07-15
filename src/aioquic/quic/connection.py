@@ -528,6 +528,8 @@ class QuicConnection:
             remote_addr=remote_addr,
             is_validated=True,
         )
+
+        # client creating network path
         self._create_network_path(
             path_id=0, 
             host_cid=host_cid, 
@@ -780,6 +782,8 @@ class QuicConnection:
         probe_timeouts = []
         for network_path in self._network_paths.values():
             probe_timeouts.append(network_path.loss.get_probe_timeout())
+        if not probe_timeouts:
+            probe_timeouts = [0]
         return max(idle_timeout, 3 * max(probe_timeouts))
 
     def receive_datagram(self, data: bytes, addr: NetworkAddress, addr_local: NetworkAddress, now: float) -> None:
@@ -817,20 +821,8 @@ class QuicConnection:
                 },
             )
 
-        # For anti-amplification purposes, servers need to keep track of the
-        # amount of data received on unvalidated network paths. We must count the
-        # entire datagram size regardless of whether packets are processed or
-        # dropped.
-        #
-        # This is particularly important when talking to clients who pad
-        # datagrams containing INITIAL packets by appending bytes after the
-        # long-header packets, which is legitimate behaviour.
-        #
-        # https://datatracker.ietf.org/doc/html/rfc9000#section-8.1
-        network_path = self._find_network_path(remote_addr, local_addr)
-        path_tuple = self._find_path_tuple(remote_addr, local_addr, network_path.path_id)
-        if not path_tuple.is_validated:
-            path_tuple.bytes_received += payload_length
+        network_path: Optional[QuicNetworkPath] = None
+        path_tuple: Optional[PathTuple] = None
 
         # for servers, arm the idle timeout on the first datagram
         if self._close_at is None:
@@ -873,13 +865,11 @@ class QuicConnection:
                     )
                 return
 
-            # Check destination CID matches.
             destination_cid_seq: Optional[int] = None
-            for np in self._network_paths.values():
-                for connection_id in np.host_cids:
-                    if header.destination_cid == connection_id.cid:
-                        destination_cid_seq = connection_id.sequence_number
-                        break
+            network_path, destination_cid_seq = self._find_network_path(
+                header.destination_cid, remote_addr, local_addr
+            )
+
             if (
                 self._is_client or header.packet_type == QuicPacketType.HANDSHAKE
             ) and destination_cid_seq is None:
@@ -1102,6 +1092,23 @@ class QuicConnection:
                 )
                 network_path.host_cid = context.host_cid
                 network_path.change_connection_id()
+            
+            # For anti-amplification purposes, servers need to keep track of the
+            # amount of data received on unvalidated network paths. We must count the
+            # entire datagram size regardless of whether packets are processed or
+            # dropped.
+            #
+            # This is particularly important when talking to clients who pad
+            # datagrams containing INITIAL packets by appending bytes after the
+            # long-header packets, which is legitimate behaviour.
+            #
+            # https://datatracker.ietf.org/doc/html/rfc9000#section-8.1
+            # FIXME: Currently, datagram size of dropped packets are ignored and 
+            # amount of data is counted per path tuple per quic path and not 
+            # solely per tuple. 
+            path_tuple = self._find_path_tuple(remote_addr, local_addr, network_path.path_id)
+            if not path_tuple.is_validated:
+                path_tuple.bytes_received += payload_length
 
             # update network path
             if not path_tuple.is_validated and epoch == tls.Epoch.HANDSHAKE:
@@ -1396,15 +1403,23 @@ class QuicConnection:
         else:
             self._network_paths[path_id] = network_path
 
-    #def _find_network_path(self, destination_cid: bytes) -> QuicNetworkPath:
-    def _find_network_path(self, remote_addr: NetworkAddress, local_addr: NetworkAddress,) -> QuicNetworkPath:
-        if len(self._network_paths) != 0:
-            return self._network_paths[0] # tmp fixed to path 0
-        # check existing network paths
-        #for np in self._network_paths.values():
-        #    for host_cid in np.host_cids:
-        #        if host_cid.cid == destination_cid:
-        #            return np
+    def _find_network_path(
+            self, destination_cid: bytes, remote_addr: NetworkAddress, local_addr: NetworkAddress,
+        ) -> Tuple[Optional[QuicNetworkPath], Optional[int]]:
+
+        # Check destination CID matches.
+        for np in self._network_paths.values():
+            for connection_id in np.host_cids:
+                if destination_cid == connection_id.cid:
+                    return (np, connection_id.sequence_number)
+        for np in self._network_paths_stock.values():
+            for connection_id in np.host_cids:
+                if destination_cid == connection_id.cid:
+                    # promote to active
+                    self._network_paths[np.path_id] = np
+                    del self._network_paths_stock[np.path_id]
+
+                    return (np, connection_id.sequence_number)
         
         if not self._is_client and len(self._network_paths) == 0:
             host_cid=QuicConnectionId(
@@ -1416,6 +1431,8 @@ class QuicConnection:
                 cid=os.urandom(self._configuration.connection_id_length), sequence_number=None
             )
             self._path_ids[host_cid.cid] = 0
+
+            # server creating network path
             self._create_network_path(
                 path_id=0,
                 host_cid=host_cid,
@@ -1427,9 +1444,13 @@ class QuicConnection:
                 ),
             )
             self._replenish_connection_ids(0)
-            return self._network_paths[0]
 
-        # todo: Further cases of 'destination CID cannot be matched'
+            return (
+                self._network_paths[0], 
+                self._network_paths[0].host_cids[0].sequence_number
+            )
+
+        return None, None
     
     def _find_path_tuple(
             self, 
