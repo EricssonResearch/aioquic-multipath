@@ -1412,14 +1412,32 @@ class QuicConnection:
             for connection_id in np.host_cids:
                 if destination_cid == connection_id.cid:
                     return (np, connection_id.sequence_number)
-        for np in self._network_paths_stock.values():
-            for connection_id in np.host_cids:
+        for stock_path in self._network_paths_stock.values():
+            for connection_id in stock_path.host_cids:
                 if destination_cid == connection_id.cid:
-                    # promote to active
-                    self._network_paths[np.path_id] = np
-                    del self._network_paths_stock[np.path_id]
+                    # assign 4-tuple
+                    path_tuple = PathTuple(
+                        local_addr=local_addr,
+                        remote_addr=remote_addr,
+                    )
+                    stock_path.active_path_tuple = path_tuple
+                    stock_path.path_tuples = [path_tuple]
 
-                    return (np, connection_id.sequence_number)
+                    # assign / consume CIDs
+                    stock_path.host_cid = stock_path.host_cids[0].cid
+                    stock_path.peer_cid = stock_path.peer_cid_available.pop(0)
+
+                    # initialize packet number space
+                    stock_path.spaces = {
+                        tls.Epoch.ONE_RTT: QuicPacketSpace(),
+                    }
+                    stock_path.loss.spaces = list(stock_path.spaces.values())
+
+                    # promote to active
+                    self._network_paths[stock_path.path_id] = stock_path
+                    del self._network_paths_stock[stock_path.path_id]
+
+                    return (stock_path, connection_id.sequence_number)
         
         if not self._is_client and len(self._network_paths) == 0:
             host_cid=QuicConnectionId(
@@ -2387,7 +2405,7 @@ class QuicConnection:
             )
                 
         self._logger.debug(
-            "Network path %s validated by challenge", 
+            "Network path (%s, %s) validated by challenge", 
             validated_path_tuple.remote_addr, 
             validated_path_tuple.local_addr,
         )
