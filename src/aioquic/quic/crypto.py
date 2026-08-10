@@ -73,7 +73,7 @@ class CryptoContext:
         self._teardown_cb = teardown_cb
 
     def decrypt_packet(
-        self, packet: bytes, encrypted_offset: int, expected_packet_number: int
+        self, packet: bytes, encrypted_offset: int, expected_packet_number: int, path_id: int = 0
     ) -> Tuple[bytes, bytes, int, bool]:
         if self.aead is None:
             raise KeyUnavailableError("Decryption key is not available")
@@ -97,19 +97,19 @@ class CryptoContext:
 
         # payload protection
         payload = crypto.aead.decrypt(
-            packet[len(plain_header) :], plain_header, packet_number
+            packet[len(plain_header) :], plain_header, packet_number, path_id
         )
 
         return plain_header, payload, packet_number, crypto != self
 
     def encrypt_packet(
-        self, plain_header: bytes, plain_payload: bytes, packet_number: int
+        self, plain_header: bytes, plain_payload: bytes, packet_number: int, path_id: int = 0
     ) -> bytes:
         assert self.is_valid(), "Encryption key is not available"
 
         # payload protection
         protected_payload = self.aead.encrypt(
-            plain_payload, plain_header, packet_number
+            plain_payload, plain_header, packet_number, path_id
         )
 
         # header protection
@@ -182,21 +182,21 @@ class CryptoPair:
         self._update_key_requested = False
 
     def decrypt_packet(
-        self, packet: bytes, encrypted_offset: int, expected_packet_number: int
+        self, packet: bytes, encrypted_offset: int, expected_packet_number: int, path_id: int = 0
     ) -> Tuple[bytes, bytes, int]:
         plain_header, payload, packet_number, update_key = self.recv.decrypt_packet(
-            packet, encrypted_offset, expected_packet_number
+            packet, encrypted_offset, expected_packet_number, path_id
         )
         if update_key:
             self._update_key("remote_update")
         return plain_header, payload, packet_number
 
     def encrypt_packet(
-        self, plain_header: bytes, plain_payload: bytes, packet_number: int
+        self, plain_header: bytes, plain_payload: bytes, packet_number: int, path_id: int = 0
     ) -> bytes:
         if self._update_key_requested:
             self._update_key("local_update")
-        return self.send.encrypt_packet(plain_header, plain_payload, packet_number)
+        return self.send.encrypt_packet(plain_header, plain_payload, packet_number, path_id)
 
     def setup_initial(self, cid: bytes, is_client: bool, version: int) -> None:
         if is_client:

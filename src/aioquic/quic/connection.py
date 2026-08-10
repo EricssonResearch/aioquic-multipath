@@ -572,6 +572,7 @@ class QuicConnection:
                     is_client=self._is_client,
                     max_datagram_size=self._max_datagram_size,
                     packet_number=network_path.packet_number,
+                    path_id = path_id,
                     peer_cid=network_path.peer_cid.cid,
                     peer_token=self._peer_token,
                     quic_logger=self._quic_logger,
@@ -947,7 +948,7 @@ class QuicConnection:
 
             try:
                 plain_header, plain_payload, packet_number = crypto.decrypt_packet(
-                    data[start_off:end_off], encrypted_off, space.expected_packet_number
+                    data[start_off:end_off], encrypted_off, space.expected_packet_number, network_path.path_id
                 )
             except KeyUnavailableError as exc:
                 self._logger.debug(exc)
