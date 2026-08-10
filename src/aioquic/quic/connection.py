@@ -799,9 +799,8 @@ class QuicConnection:
         :param addr: The network address from which the datagram was received.
         :param now: The current time.
         """
-        remote_addr = addr # tmp fix for testing
-        local_addr = addr_local #("::ffff:127.0.0.1", 1234, 0, 0) # tmp dummy addr
-        #destination_cid = os.urandom(self._configuration.connection_id_length) # tmp dummy cid
+        remote_addr = addr
+        local_addr = addr_local
         payload_length = len(data)
 
         # stop handling packets when closing
@@ -3407,7 +3406,7 @@ class QuicConnection:
                             builder=builder,
                             space=space,
                             now=now,
-                            ack_path_id=0
+                            ack_path_id=network_path.path_id
                         )
                     else:
                         self._write_ack_frame(builder=builder, space=space, now=now)
