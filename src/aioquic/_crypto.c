@@ -119,8 +119,9 @@ AEAD_decrypt(AEADObject *self, PyObject *args)
     Py_ssize_t data_len, associated_len;
     int outlen, outlen2, res;
     uint64_t pn;
+    uint64_t id;
 
-    if (!PyArg_ParseTuple(args, "y#y#K", &data, &data_len, &associated, &associated_len, &pn))
+    if (!PyArg_ParseTuple(args, "y#y#KK", &data, &data_len, &associated, &associated_len, &pn, &id))
         return NULL;
 
     if (data_len < AEAD_TAG_LENGTH || data_len > PACKET_LENGTH_MAX) {
@@ -129,8 +130,17 @@ AEAD_decrypt(AEADObject *self, PyObject *args)
     }
 
     memcpy(self->nonce, self->iv, AEAD_NONCE_LENGTH);
+
+    // set first two bits (MSB) of pn to 0
+    uint64_t mask = 0x11 << 62; // 1100|0000|0000|...
+    mask &= pn; // pn1 pn2 0 0 |0000|0000|...
+    pn ^= mask; // 0 0 pn3 pn4 | pn5 pn6 pn7 pn8 | ...
+
     for (int i = 0; i < 8; ++i) {
         self->nonce[AEAD_NONCE_LENGTH - 1 - i] ^= (uint8_t)(pn >> 8 * i);
+    }
+    for (int i = 0; i < 4; ++i) {
+        self->nonce[AEAD_NONCE_LENGTH - 9 - i] ^= (uint8_t)(id >> 8 * i);
     }
 
     res = EVP_CIPHER_CTX_ctrl(self->decrypt_ctx, EVP_CTRL_CCM_SET_TAG, AEAD_TAG_LENGTH, (void*)(data + (data_len - AEAD_TAG_LENGTH)));
@@ -161,8 +171,9 @@ AEAD_encrypt(AEADObject *self, PyObject *args)
     Py_ssize_t data_len, associated_len;
     int outlen, outlen2, res;
     uint64_t pn;
+    uint64_t id;
 
-    if (!PyArg_ParseTuple(args, "y#y#K", &data, &data_len, &associated, &associated_len, &pn))
+    if (!PyArg_ParseTuple(args, "y#y#KK", &data, &data_len, &associated, &associated_len, &pn, &id))
         return NULL;
 
     if (data_len > PACKET_LENGTH_MAX) {
@@ -171,8 +182,17 @@ AEAD_encrypt(AEADObject *self, PyObject *args)
     }
 
     memcpy(self->nonce, self->iv, AEAD_NONCE_LENGTH);
+
+    // set first two bits (MSB) of pn to 0
+    uint64_t mask = 0x11 << 62; // 1100|0000|0000|...
+    mask &= pn; // pn1 pn2 0 0 |0000|0000|...
+    pn ^= mask; // 0 0 pn3 pn4 | pn5 pn6 pn7 pn8 | ...
+
     for (int i = 0; i < 8; ++i) {
         self->nonce[AEAD_NONCE_LENGTH - 1 - i] ^= (uint8_t)(pn >> 8 * i);
+    }
+    for (int i = 0; i < 4; ++i) {
+        self->nonce[AEAD_NONCE_LENGTH - 9 - i] ^= (uint8_t)(id >> 8 * i);
     }
 
     res = EVP_CipherInit_ex(self->encrypt_ctx, NULL, NULL, self->key, self->nonce, 1);

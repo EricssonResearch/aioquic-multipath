@@ -63,6 +63,7 @@ class QuicPacketBuilder:
         is_client: bool,
         max_datagram_size: int,
         packet_number: int = 0,
+        path_id: int = 0,
         peer_token: bytes = b"",
         quic_logger: Optional[QuicLoggerTrace] = None,
         spin_bit: bool = False,
@@ -73,6 +74,7 @@ class QuicPacketBuilder:
 
         self._host_cid = host_cid
         self._is_client = is_client
+        self._path_id = path_id
         self._peer_cid = peer_cid
         self._peer_token = peer_token
         self._quic_logger = quic_logger
@@ -346,6 +348,7 @@ class QuicPacketBuilder:
                     plain[0 : self._header_size],
                     plain[self._header_size : packet_size],
                     self._packet_number,
+                    self._path_id
                 )
             )
             self._packet.sent_bytes = buf.tell() - self._packet_start
