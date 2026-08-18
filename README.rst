@@ -137,6 +137,21 @@ Running the examples
 
 You can browse these examples here: https://github.com/aiortc/aioquic/tree/main/examples
 
+Running multipath example
+-------------------------
+
+Server:
+
+.. code-block:: console
+
+   python3 examples/http3_server.py --host localhost --port 4433 --certificate tests/ssl_cert.pem --private-key tests/ssl_key.pem --quic-log ./logs/server --secrets-log ssl.log -v --additional-interface localhost:4434 --additional-interface localhost:4435
+
+Client:
+
+.. code-block:: console
+
+   python3 examples/http3_client.py --insecure --ca-certs tests/pycacert.pem https://localhost:4433/10000000 --quic-log ./logs/client --output-dir ./logs/client --secrets-log ssl.log -v --add-path localhost:4434
+
 License
 -------
 
