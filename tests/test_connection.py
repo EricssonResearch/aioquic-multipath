@@ -75,10 +75,13 @@ class SessionTicketStore:
 
 
 def client_receive_context(client, epoch=tls.Epoch.ONE_RTT):
+    network_path = client._network_paths[0]
     return QuicReceiveContext(
         epoch=epoch,
-        host_cid=client.host_cid,
-        network_path=client._network_paths[0],
+        host_cid=network_path.host_cid,
+        local_addr=network_path.active_path_tuple.local_addr,
+        remote_addr=network_path.active_path_tuple.remote_addr,
+        path_id=network_path.path_id,
         quic_logger_frames=[],
         time=time.time(),
         version=None,
@@ -101,7 +104,7 @@ def create_standalone_client(self, **client_options):
     client._ack_delay = 0
 
     # kick-off handshake
-    client.connect(SERVER_ADDR, now=time.time())
+    client.connect(SERVER_ADDR, CLIENT_ADDR, now=time.time())
     self.assertEqual(drop(client), 1)
 
     return client
@@ -179,7 +182,7 @@ def client_and_server(
 
     # perform handshake
     if handshake:
-        client.connect(SERVER_ADDR, now=time.time())
+        client.connect(SERVER_ADDR, CLIENT_ADDR, now=time.time())
         for i in range(3):
             roundtrip(client, server)
 
@@ -198,7 +201,24 @@ def disable_packet_pacing(connection):
         def next_send_time(self, now):
             return None
 
-    connection._loss._pacer = DummyPacketPacer()
+    # Packet pacing lives on the per-path recovery object
+    # (QuicNetworkPath.loss._pacer), and paths can be created lazily
+    # (e.g. path 0 is only created once connect()/the first packet is
+    # processed). Wrap path creation so every current and future path
+    # on this connection gets a dummy, always-ready pacer.
+    for network_path in connection._network_paths.values():
+        network_path.loss._pacer = DummyPacketPacer()
+
+    original_create_network_path = connection._create_network_path
+
+    def _create_network_path_with_dummy_pacer(*args, **kwargs):
+        original_create_network_path(*args, **kwargs)
+        for paths in (connection._network_paths, connection._network_paths_stock):
+            for network_path in paths.values():
+                if not isinstance(network_path.loss._pacer, DummyPacketPacer):
+                    network_path.loss._pacer = DummyPacketPacer()
+
+    connection._create_network_path = _create_network_path_with_dummy_pacer
 
 
 def encode_transport_parameters(parameters: QuicTransportParameters) -> bytes:
@@ -241,10 +261,14 @@ def transfer(sender, receiver):
     Send datagrams from `sender` to `receiver`.
     """
     datagrams = 0
-    from_addr = CLIENT_ADDR if sender._is_client else SERVER_ADDR
-    for data, addr in sender.datagrams_to_send(now=time.time()):
+    for data, remote_addr, local_addr in sender.datagrams_to_send(now=time.time()):
         datagrams += 1
-        receiver.receive_datagram(data, from_addr, now=time.time())
+        # from the receiver's perspective, the datagram arrives from the
+        # sender's local_addr, on the receiver's own local_addr (i.e. the
+        # sender's remote_addr).
+        receiver.receive_datagram(
+            data, local_addr, addr_local=remote_addr, now=time.time()
+        )
     return datagrams
 
 
@@ -269,7 +293,10 @@ class QuicConnectionTest(TestCase):
         self.assertEqual(found_trigger, trigger)
 
     def assertSentPackets(self, connection: QuicConnection, expected: list[int]):
-        counts = [len(space.sent_packets) for space in connection._loss.spaces]
+        counts = [
+            len(space.sent_packets)
+            for space in connection._network_paths[0].loss.spaces
+        ]
         self.assertEqual(counts, expected)
 
     def check_handshake(self, client, server, alpn_protocol=None):
@@ -305,10 +332,10 @@ class QuicConnectionTest(TestCase):
 
             # check each endpoint has available connection IDs for the peer
             self.assertEqual(
-                sequence_numbers(client._peer_cid_available), [1, 2, 3, 4, 5, 6, 7]
+                sequence_numbers(client._network_paths[0].peer_cid_available), [1, 2, 3, 4, 5, 6, 7]
             )
             self.assertEqual(
-                sequence_numbers(server._peer_cid_available), [1, 2, 3, 4, 5, 6, 7]
+                sequence_numbers(server._network_paths[0].peer_cid_available), [1, 2, 3, 4, 5, 6, 7]
             )
 
             # client closes the connection
@@ -446,7 +473,7 @@ class QuicConnectionTest(TestCase):
         client = QuicConnection(configuration=client_configuration)
 
         now = 0.0
-        client.connect(SERVER_ADDR, now=now)
+        client.connect(SERVER_ADDR, CLIENT_ADDR, now=now)
         items = client.datagrams_to_send(now=now)
         self.assertEqual(datagram_sizes(items), [1480])
 
@@ -457,7 +484,7 @@ class QuicConnectionTest(TestCase):
         with client_and_server(handshake=False) as (client, server):
             # client sends INITIAL
             now = 0.0
-            client.connect(SERVER_ADDR, now=now)
+            client.connect(SERVER_ADDR, CLIENT_ADDR, now=now)
             items = client.datagrams_to_send(now=now)
             self.assertEqual(datagram_sizes(items), [1200])
             self.assertEqual(client.get_timer(), 0.2)
@@ -466,7 +493,7 @@ class QuicConnectionTest(TestCase):
 
             # server receives INITIAL, sends INITIAL + HANDSHAKE
             now += TICK
-            server.receive_datagram(items[0][0], CLIENT_ADDR, now=now)
+            server.receive_datagram(items[0][0], CLIENT_ADDR, addr_local=SERVER_ADDR, now=now)
             items = server.datagrams_to_send(now=now)
             self.assertEqual(datagram_sizes(items), SERVER_INITIAL_DATAGRAM_SIZES)
             self.assertAlmostEqual(server.get_timer(), 0.25)
@@ -475,8 +502,8 @@ class QuicConnectionTest(TestCase):
 
             # handshake continues normally
             now += TICK
-            client.receive_datagram(items[0][0], SERVER_ADDR, now=now)
-            client.receive_datagram(items[1][0], SERVER_ADDR, now=now)
+            client.receive_datagram(items[0][0], SERVER_ADDR, addr_local=CLIENT_ADDR, now=now)
+            client.receive_datagram(items[1][0], SERVER_ADDR, addr_local=CLIENT_ADDR, now=now)
             items = client.datagrams_to_send(now=now)
             self.assertEqual(datagram_sizes(items), CLIENT_HANDSHAKE_DATAGRAM_SIZES)
             self.assertAlmostEqual(client.get_timer(), 0.425)
@@ -486,7 +513,7 @@ class QuicConnectionTest(TestCase):
             )
 
             now += TICK
-            server.receive_datagram(items[0][0], CLIENT_ADDR, now=now)
+            server.receive_datagram(items[0][0], CLIENT_ADDR, addr_local=SERVER_ADDR, now=now)
             items = server.datagrams_to_send(now=now)
             self.assertEqual(datagram_sizes(items), [229])
             self.assertAlmostEqual(server.get_timer(), 0.425)
@@ -494,7 +521,7 @@ class QuicConnectionTest(TestCase):
             self.assertEvents(server, HANDSHAKE_COMPLETED_EVENTS)
 
             now += TICK
-            client.receive_datagram(items[0][0], SERVER_ADDR, now=now)
+            client.receive_datagram(items[0][0], SERVER_ADDR, addr_local=CLIENT_ADDR, now=now)
             items = client.datagrams_to_send(now=now)
             self.assertEqual(datagram_sizes(items), [32])
             self.assertAlmostEqual(client.get_timer(), 60.2)  # idle timeout
@@ -511,7 +538,7 @@ class QuicConnectionTest(TestCase):
         with client_and_server(handshake=False) as (client, server):
             # client sends INITIAL
             now = 0.0
-            client.connect(SERVER_ADDR, now=now)
+            client.connect(SERVER_ADDR, CLIENT_ADDR, now=now)
             items = client.datagrams_to_send(now=now)
             self.assertEqual(datagram_sizes(items), [1200])
             self.assertEqual(client.get_timer(), 0.2)
@@ -529,7 +556,7 @@ class QuicConnectionTest(TestCase):
 
             # server receives INITIAL, sends INITIAL + HANDSHAKE
             now += TICK
-            server.receive_datagram(items[0][0], CLIENT_ADDR, now=now)
+            server.receive_datagram(items[0][0], CLIENT_ADDR, addr_local=SERVER_ADDR, now=now)
             items = server.datagrams_to_send(now=now)
             self.assertEqual(datagram_sizes(items), SERVER_INITIAL_DATAGRAM_SIZES)
             self.assertAlmostEqual(server.get_timer(), 0.45)
@@ -538,8 +565,8 @@ class QuicConnectionTest(TestCase):
 
             # handshake continues normally
             now += TICK
-            client.receive_datagram(items[0][0], SERVER_ADDR, now=now)
-            client.receive_datagram(items[1][0], SERVER_ADDR, now=now)
+            client.receive_datagram(items[0][0], SERVER_ADDR, addr_local=CLIENT_ADDR, now=now)
+            client.receive_datagram(items[1][0], SERVER_ADDR, addr_local=CLIENT_ADDR, now=now)
             items = client.datagrams_to_send(now=now)
             self.assertEqual(datagram_sizes(items), CLIENT_HANDSHAKE_DATAGRAM_SIZES)
             self.assertAlmostEqual(client.get_timer(), 0.625)
@@ -549,7 +576,7 @@ class QuicConnectionTest(TestCase):
             )
 
             now += TICK
-            server.receive_datagram(items[0][0], CLIENT_ADDR, now=now)
+            server.receive_datagram(items[0][0], CLIENT_ADDR, addr_local=SERVER_ADDR, now=now)
             items = server.datagrams_to_send(now=now)
             self.assertEqual(datagram_sizes(items), [229])
             self.assertAlmostEqual(server.get_timer(), 0.625)
@@ -557,7 +584,7 @@ class QuicConnectionTest(TestCase):
             self.assertEvents(server, HANDSHAKE_COMPLETED_EVENTS)
 
             now += TICK
-            client.receive_datagram(items[0][0], SERVER_ADDR, now=now)
+            client.receive_datagram(items[0][0], SERVER_ADDR, addr_local=CLIENT_ADDR, now=now)
             items = client.datagrams_to_send(now=now)
             self.assertEqual(datagram_sizes(items), [32])
             self.assertAlmostEqual(client.get_timer(), 60.4)  # idle timeout
@@ -575,7 +602,7 @@ class QuicConnectionTest(TestCase):
         with client_and_server(handshake=False) as (client, server):
             # client sends INITIAL
             now = 0.0
-            client.connect(SERVER_ADDR, now=now)
+            client.connect(SERVER_ADDR, CLIENT_ADDR, now=now)
             items = client.datagrams_to_send(now=now)
             self.assertEqual(datagram_sizes(items), [1200])
             self.assertEqual(client.get_timer(), 0.2)
@@ -585,7 +612,7 @@ class QuicConnectionTest(TestCase):
             # server receives INITIAL, sends INITIAL + HANDSHAKE but first datagram
             # is lost
             now += TICK
-            server.receive_datagram(items[0][0], CLIENT_ADDR, now=now)
+            server.receive_datagram(items[0][0], CLIENT_ADDR, addr_local=SERVER_ADDR, now=now)
             items = server.datagrams_to_send(now=now)
             self.assertEqual(datagram_sizes(items), SERVER_INITIAL_DATAGRAM_SIZES)
             self.assertEqual(server.get_timer(), 0.25)
@@ -594,7 +621,7 @@ class QuicConnectionTest(TestCase):
 
             # client only receives second datagram, retransmits INITIAL
             now += TICK
-            client.receive_datagram(items[1][0], SERVER_ADDR, now=now)
+            client.receive_datagram(items[1][0], SERVER_ADDR, addr_local=CLIENT_ADDR, now=now)
             items = client.datagrams_to_send(now=now)
             self.assertEqual(datagram_sizes(items), [1200])
             self.assertAlmostEqual(client.get_timer(), 0.3)
@@ -605,7 +632,7 @@ class QuicConnectionTest(TestCase):
 
             # server receives duplicate INITIAL, retransmits INITIAL + HANDSHAKE
             now += TICK
-            server.receive_datagram(items[0][0], CLIENT_ADDR, now=now)
+            server.receive_datagram(items[0][0], CLIENT_ADDR, addr_local=SERVER_ADDR, now=now)
             items = server.datagrams_to_send(now=now)
             self.assertEqual(datagram_sizes(items), SERVER_INITIAL_DATAGRAM_SIZES)
             self.assertAlmostEqual(server.get_timer(), 0.35)
@@ -614,8 +641,8 @@ class QuicConnectionTest(TestCase):
 
             # handshake continues normally
             now += TICK
-            client.receive_datagram(items[0][0], SERVER_ADDR, now=now)
-            client.receive_datagram(items[1][0], SERVER_ADDR, now=now)
+            client.receive_datagram(items[0][0], SERVER_ADDR, addr_local=CLIENT_ADDR, now=now)
+            client.receive_datagram(items[1][0], SERVER_ADDR, addr_local=CLIENT_ADDR, now=now)
             items = client.datagrams_to_send(now=now)
             self.assertEqual(datagram_sizes(items), CLIENT_HANDSHAKE_DATAGRAM_SIZES)
             self.assertAlmostEqual(client.get_timer(), 0.525)
@@ -625,7 +652,7 @@ class QuicConnectionTest(TestCase):
             )
 
             now += TICK
-            server.receive_datagram(items[0][0], CLIENT_ADDR, now=now)
+            server.receive_datagram(items[0][0], CLIENT_ADDR, addr_local=SERVER_ADDR, now=now)
             items = server.datagrams_to_send(now=now)
             self.assertEqual(datagram_sizes(items), [229])
             self.assertAlmostEqual(server.get_timer(), 0.525)
@@ -633,7 +660,7 @@ class QuicConnectionTest(TestCase):
             self.assertEvents(server, HANDSHAKE_COMPLETED_EVENTS)
 
             now += TICK
-            client.receive_datagram(items[0][0], SERVER_ADDR, now=now)
+            client.receive_datagram(items[0][0], SERVER_ADDR, addr_local=CLIENT_ADDR, now=now)
             items = client.datagrams_to_send(now=now)
             self.assertEqual(datagram_sizes(items), [32])
             self.assertAlmostEqual(client.get_timer(), 60.3)  # idle timeout
@@ -652,7 +679,7 @@ class QuicConnectionTest(TestCase):
         with client_and_server(handshake=False) as (client, server):
             # client sends INITIAL
             now = 0.0
-            client.connect(SERVER_ADDR, now=now)
+            client.connect(SERVER_ADDR, CLIENT_ADDR, now=now)
             items = client.datagrams_to_send(now=now)
             self.assertEqual(datagram_sizes(items), [1200])
             self.assertEqual(client.get_timer(), 0.2)
@@ -661,7 +688,7 @@ class QuicConnectionTest(TestCase):
 
             # server receives INITIAL, sends INITIAL + HANDSHAKE
             now += TICK
-            server.receive_datagram(items[0][0], CLIENT_ADDR, now=now)
+            server.receive_datagram(items[0][0], CLIENT_ADDR, addr_local=SERVER_ADDR, now=now)
             items = server.datagrams_to_send(now=now)
             self.assertEqual(datagram_sizes(items), SERVER_INITIAL_DATAGRAM_SIZES)
             self.assertEqual(server.get_timer(), 0.25)
@@ -679,7 +706,7 @@ class QuicConnectionTest(TestCase):
 
             # server receives duplicate INITIAL, retransmits INITIAL + HANDSHAKE
             now += TICK
-            server.receive_datagram(items[0][0], CLIENT_ADDR, now=now)
+            server.receive_datagram(items[0][0], CLIENT_ADDR, addr_local=SERVER_ADDR, now=now)
             items = server.datagrams_to_send(now=now)
             self.assertEqual(datagram_sizes(items), SERVER_INITIAL_DATAGRAM_SIZES)
             self.assertEqual(server.get_timer(), 0.45)
@@ -688,8 +715,8 @@ class QuicConnectionTest(TestCase):
 
             # handshake continues normally
             now += TICK
-            client.receive_datagram(items[0][0], SERVER_ADDR, now=now)
-            client.receive_datagram(items[1][0], SERVER_ADDR, now=now)
+            client.receive_datagram(items[0][0], SERVER_ADDR, addr_local=CLIENT_ADDR, now=now)
+            client.receive_datagram(items[1][0], SERVER_ADDR, addr_local=CLIENT_ADDR, now=now)
             items = client.datagrams_to_send(now=now)
             self.assertEqual(datagram_sizes(items), CLIENT_HANDSHAKE_DATAGRAM_SIZES)
             self.assertAlmostEqual(client.get_timer(), 0.625)
@@ -699,7 +726,7 @@ class QuicConnectionTest(TestCase):
             )
 
             now += TICK
-            server.receive_datagram(items[0][0], CLIENT_ADDR, now=now)
+            server.receive_datagram(items[0][0], CLIENT_ADDR, addr_local=SERVER_ADDR, now=now)
             items = server.datagrams_to_send(now=now)
             self.assertEqual(datagram_sizes(items), [229])
             self.assertAlmostEqual(server.get_timer(), 0.625)
@@ -707,7 +734,7 @@ class QuicConnectionTest(TestCase):
             self.assertEvents(server, HANDSHAKE_COMPLETED_EVENTS)
 
             now += TICK
-            client.receive_datagram(items[0][0], SERVER_ADDR, now=now)
+            client.receive_datagram(items[0][0], SERVER_ADDR, addr_local=CLIENT_ADDR, now=now)
             items = client.datagrams_to_send(now=now)
             self.assertEqual(datagram_sizes(items), [32])
             self.assertAlmostEqual(client.get_timer(), 60.4)  # idle timeout
@@ -721,7 +748,7 @@ class QuicConnectionTest(TestCase):
         with client_and_server(handshake=False) as (client, server):
             # client sends INITIAL
             now = 0.0
-            client.connect(SERVER_ADDR, now=now)
+            client.connect(SERVER_ADDR, CLIENT_ADDR, now=now)
             items = client.datagrams_to_send(now=now)
             self.assertEqual(datagram_sizes(items), [1200])
             self.assertEqual(client.get_timer(), 0.2)
@@ -731,7 +758,7 @@ class QuicConnectionTest(TestCase):
             # server receives INITIAL, sends ACK + INITIAL + HANDSHAKE but third
             # datagram is lost
             now += TICK
-            server.receive_datagram(items[0][0], CLIENT_ADDR, now=now)
+            server.receive_datagram(items[0][0], CLIENT_ADDR, addr_local=SERVER_ADDR, now=now)
             items = server.datagrams_to_send(now=now)
             self.assertEqual(datagram_sizes(items), SERVER_INITIAL_DATAGRAM_SIZES)
             self.assertEqual(server.get_timer(), 0.25)
@@ -740,7 +767,7 @@ class QuicConnectionTest(TestCase):
 
             # client only receives the first datagram and sends ACKS
             now += TICK
-            client.receive_datagram(items[0][0], SERVER_ADDR, now=now)
+            client.receive_datagram(items[0][0], SERVER_ADDR, addr_local=CLIENT_ADDR, now=now)
             items = client.datagrams_to_send(now=now)
             self.assertEqual(datagram_sizes(items), [1200])
             self.assertAlmostEqual(client.get_timer(), 0.325)
@@ -758,7 +785,7 @@ class QuicConnectionTest(TestCase):
 
             # server receives PING, discards INITIAL and sends ACK
             now += TICK
-            server.receive_datagram(items[0][0], CLIENT_ADDR, now=now)
+            server.receive_datagram(items[0][0], CLIENT_ADDR, addr_local=SERVER_ADDR, now=now)
             items = server.datagrams_to_send(now=now)
             self.assertEqual(datagram_sizes(items), [48])
             self.assertAlmostEqual(server.get_timer(), 0.25)
@@ -776,8 +803,8 @@ class QuicConnectionTest(TestCase):
 
             # handshake continues normally
             now += TICK
-            client.receive_datagram(items[0][0], SERVER_ADDR, now=now)
-            client.receive_datagram(items[1][0], SERVER_ADDR, now=now)
+            client.receive_datagram(items[0][0], SERVER_ADDR, addr_local=CLIENT_ADDR, now=now)
+            client.receive_datagram(items[1][0], SERVER_ADDR, addr_local=CLIENT_ADDR, now=now)
             items = client.datagrams_to_send(now=now)
             self.assertEqual(datagram_sizes(items), [329])
             self.assertAlmostEqual(client.get_timer(), 0.95)
@@ -785,7 +812,7 @@ class QuicConnectionTest(TestCase):
             self.assertEvents(client, HANDSHAKE_COMPLETED_EVENTS)
 
             now += TICK
-            server.receive_datagram(items[0][0], CLIENT_ADDR, now=now)
+            server.receive_datagram(items[0][0], CLIENT_ADDR, addr_local=SERVER_ADDR, now=now)
             items = server.datagrams_to_send(now=now)
             self.assertEqual(datagram_sizes(items), [229])
             self.assertAlmostEqual(server.get_timer(), 0.675)
@@ -793,7 +820,7 @@ class QuicConnectionTest(TestCase):
             self.assertEvents(server, HANDSHAKE_COMPLETED_EVENTS)
 
             now += TICK
-            client.receive_datagram(items[0][0], SERVER_ADDR, now=now)
+            client.receive_datagram(items[0][0], SERVER_ADDR, addr_local=CLIENT_ADDR, now=now)
             items = client.datagrams_to_send(now=now)
             self.assertEqual(datagram_sizes(items), [32])
             self.assertAlmostEqual(client.get_timer(), 60.4)  # idle timeout
@@ -807,14 +834,14 @@ class QuicConnectionTest(TestCase):
         with client_and_server(handshake=False) as (client, server):
             # client sends INITIAL
             now = 0.0
-            client.connect(SERVER_ADDR, now=now)
+            client.connect(SERVER_ADDR, CLIENT_ADDR, now=now)
             items = client.datagrams_to_send(now=now)
             self.assertEqual(datagram_sizes(items), [1200])
             self.assertEqual(client.get_timer(), 0.2)
 
             # server receives INITIAL, sends INITIAL + HANDSHAKE
             now += TICK
-            server.receive_datagram(items[0][0], CLIENT_ADDR, now=now)
+            server.receive_datagram(items[0][0], CLIENT_ADDR, addr_local=SERVER_ADDR, now=now)
             items = server.datagrams_to_send(now=now)
             self.assertEqual(datagram_sizes(items), SERVER_INITIAL_DATAGRAM_SIZES)
             self.assertEqual(server.get_timer(), 0.25)
@@ -823,8 +850,8 @@ class QuicConnectionTest(TestCase):
 
             # client receives INITIAL + HANDSHAKE
             now += TICK
-            client.receive_datagram(items[0][0], SERVER_ADDR, now=now)
-            client.receive_datagram(items[1][0], SERVER_ADDR, now=now)
+            client.receive_datagram(items[0][0], SERVER_ADDR, addr_local=CLIENT_ADDR, now=now)
+            client.receive_datagram(items[1][0], SERVER_ADDR, addr_local=CLIENT_ADDR, now=now)
             items = client.datagrams_to_send(now=now)
             self.assertEqual(datagram_sizes(items), CLIENT_HANDSHAKE_DATAGRAM_SIZES)
             self.assertAlmostEqual(client.get_timer(), 0.425)
@@ -835,7 +862,7 @@ class QuicConnectionTest(TestCase):
 
             # server completes handshake, but HANDSHAKE_DONE is lost
             now += TICK
-            server.receive_datagram(items[0][0], CLIENT_ADDR, now=now)
+            server.receive_datagram(items[0][0], CLIENT_ADDR, addr_local=SERVER_ADDR, now=now)
             items = server.datagrams_to_send(now=now)
             self.assertEqual(datagram_sizes(items), [229])
             self.assertAlmostEqual(server.get_timer(), 0.425)
@@ -853,7 +880,7 @@ class QuicConnectionTest(TestCase):
 
             # client receives PING, sends ACK
             now += TICK
-            client.receive_datagram(items[0][0], SERVER_ADDR, now=now)
+            client.receive_datagram(items[0][0], SERVER_ADDR, addr_local=CLIENT_ADDR, now=now)
             items = client.datagrams_to_send(now=now)
             self.assertEqual(datagram_sizes(items), [32])
             self.assertAlmostEqual(client.get_timer(), 0.425)
@@ -863,7 +890,7 @@ class QuicConnectionTest(TestCase):
             # server receives ACK, retransmits HANDSHAKE_DONE
             now += TICK
             self.assertFalse(server._handshake_done_pending)
-            server.receive_datagram(items[0][0], CLIENT_ADDR, now=now)
+            server.receive_datagram(items[0][0], CLIENT_ADDR, addr_local=SERVER_ADDR, now=now)
             self.assertTrue(server._handshake_done_pending)
             items = server.datagrams_to_send(now=now)
             self.assertFalse(server._handshake_done_pending)
@@ -874,7 +901,7 @@ class QuicConnectionTest(TestCase):
             self.assertEvents(server, HANDSHAKE_COMPLETED_EVENTS[1:])
 
             now += TICK
-            client.receive_datagram(items[0][0], SERVER_ADDR, now=now)
+            client.receive_datagram(items[0][0], SERVER_ADDR, addr_local=CLIENT_ADDR, now=now)
             items = client.datagrams_to_send(now=now)
             self.assertEqual(datagram_sizes(items), [32])
             self.assertAlmostEqual(client.get_timer(), 0.425)
@@ -882,7 +909,7 @@ class QuicConnectionTest(TestCase):
             self.assertEvents(client, [])
 
             now += TICK
-            server.receive_datagram(items[0][0], CLIENT_ADDR, now=now)
+            server.receive_datagram(items[0][0], CLIENT_ADDR, addr_local=SERVER_ADDR, now=now)
             items = server.datagrams_to_send(now=now)
             self.assertEqual(datagram_sizes(items), [])
             self.assertAlmostEqual(server.get_timer(), 60.625)  # idle timeout
@@ -901,15 +928,15 @@ class QuicConnectionTest(TestCase):
         )
 
         builder = QuicPacketBuilder(
-            host_cid=client._peer_cid.cid,
+            host_cid=client._network_paths[0].peer_cid.cid,
             is_client=False,
             max_datagram_size=1000,  # too small!
-            peer_cid=client.host_cid,
+            peer_cid=client._network_paths[0].host_cid,
             version=client._version,
         )
         crypto = CryptoPair()
         crypto.setup_initial(
-            client._peer_cid.cid, is_client=False, version=client._version
+            client._network_paths[0].peer_cid.cid, is_client=False, version=client._version
         )
         builder.start_packet(QuicPacketType.INITIAL, crypto)
         buf = builder.start_frame(QuicFrameType.PADDING)
@@ -1064,7 +1091,7 @@ class QuicConnectionTest(TestCase):
             server_kwargs={"session_ticket_fetcher": ticket_store.pop},
             handshake=False,
         ) as (client, server):
-            client.connect(SERVER_ADDR, now=time.time())
+            client.connect(SERVER_ADDR, CLIENT_ADDR, now=time.time())
             stream_id = client.get_next_available_stream_id()
             client.send_stream_data(stream_id, b"hello")
 
@@ -1110,71 +1137,71 @@ class QuicConnectionTest(TestCase):
     def test_change_connection_id(self):
         with client_and_server() as (client, server):
             self.assertEqual(
-                sequence_numbers(client._peer_cid_available), [1, 2, 3, 4, 5, 6, 7]
+                sequence_numbers(client._network_paths[0].peer_cid_available), [1, 2, 3, 4, 5, 6, 7]
             )
 
             # the client changes connection ID
-            client.change_connection_id()
+            client._network_paths[0].change_connection_id()
             self.assertEqual(transfer(client, server), 1)
             self.assertEqual(
-                sequence_numbers(client._peer_cid_available), [2, 3, 4, 5, 6, 7]
+                sequence_numbers(client._network_paths[0].peer_cid_available), [2, 3, 4, 5, 6, 7]
             )
 
             # the server provides a new connection ID
             self.assertEqual(transfer(server, client), 1)
             self.assertEqual(
-                sequence_numbers(client._peer_cid_available), [2, 3, 4, 5, 6, 7, 8]
+                sequence_numbers(client._network_paths[0].peer_cid_available), [2, 3, 4, 5, 6, 7, 8]
             )
 
     def test_change_connection_id_retransmit_new_connection_id(self):
         with client_and_server() as (client, server):
             self.assertEqual(
-                sequence_numbers(client._peer_cid_available), [1, 2, 3, 4, 5, 6, 7]
+                sequence_numbers(client._network_paths[0].peer_cid_available), [1, 2, 3, 4, 5, 6, 7]
             )
 
             # the client changes connection ID
-            client.change_connection_id()
+            client._network_paths[0].change_connection_id()
             self.assertEqual(transfer(client, server), 1)
             self.assertEqual(
-                sequence_numbers(client._peer_cid_available), [2, 3, 4, 5, 6, 7]
+                sequence_numbers(client._network_paths[0].peer_cid_available), [2, 3, 4, 5, 6, 7]
             )
 
             # the server provides a new connection ID, NEW_CONNECTION_ID is lost
             self.assertEqual(drop(server), 1)
             self.assertEqual(
-                sequence_numbers(client._peer_cid_available), [2, 3, 4, 5, 6, 7]
+                sequence_numbers(client._network_paths[0].peer_cid_available), [2, 3, 4, 5, 6, 7]
             )
 
             # NEW_CONNECTION_ID is retransmitted
             server._on_new_connection_id_delivery(
-                QuicDeliveryState.LOST, server._host_cids[-1]
+                QuicDeliveryState.LOST, server._network_paths[0].host_cids[-1]
             )
             self.assertEqual(transfer(server, client), 1)
             self.assertEqual(
-                sequence_numbers(client._peer_cid_available), [2, 3, 4, 5, 6, 7, 8]
+                sequence_numbers(client._network_paths[0].peer_cid_available), [2, 3, 4, 5, 6, 7, 8]
             )
 
     def test_change_connection_id_retransmit_retire_connection_id(self):
         with client_and_server() as (client, server):
             self.assertEqual(
-                sequence_numbers(client._peer_cid_available), [1, 2, 3, 4, 5, 6, 7]
+                sequence_numbers(client._network_paths[0].peer_cid_available), [1, 2, 3, 4, 5, 6, 7]
             )
 
             # the client changes connection ID, RETIRE_CONNECTION_ID is lost
-            client.change_connection_id()
+            client._network_paths[0].change_connection_id()
             self.assertEqual(drop(client), 1)
             self.assertEqual(
-                sequence_numbers(client._peer_cid_available), [2, 3, 4, 5, 6, 7]
+                sequence_numbers(client._network_paths[0].peer_cid_available), [2, 3, 4, 5, 6, 7]
             )
 
             # RETIRE_CONNECTION_ID is retransmitted
-            client._on_retire_connection_id_delivery(QuicDeliveryState.LOST, 0)
+            client._on_retire_connection_id_delivery(QuicDeliveryState.LOST, 0, path_id=0)
             self.assertEqual(transfer(client, server), 1)
 
             # the server provides a new connection ID
             self.assertEqual(transfer(server, client), 1)
             self.assertEqual(
-                sequence_numbers(client._peer_cid_available), [2, 3, 4, 5, 6, 7, 8]
+                sequence_numbers(client._network_paths[0].peer_cid_available), [2, 3, 4, 5, 6, 7, 8]
             )
 
     def test_get_next_available_stream_id(self):
@@ -1272,8 +1299,8 @@ class QuicConnectionTest(TestCase):
 
             # server sends close
             server.close(error_code=QuicErrorCode.NO_ERROR)
-            for data, addr in server.datagrams_to_send(now=time.time()):
-                client.receive_datagram(data, SERVER_ADDR, now=time.time())
+            for data, addr, local_addr in server.datagrams_to_send(now=time.time()):
+                client.receive_datagram(data, SERVER_ADDR, addr_local=CLIENT_ADDR, now=time.time())
 
     def test_tls_error(self):
         def patch(client):
@@ -1303,21 +1330,21 @@ class QuicConnectionTest(TestCase):
         client = create_standalone_client(self)
 
         datagram = binascii.unhexlify("c00000000080")
-        client.receive_datagram(datagram, SERVER_ADDR, now=time.time())
+        client.receive_datagram(datagram, SERVER_ADDR, addr_local=CLIENT_ADDR, now=time.time())
 
     def test_receive_datagram_reserved_bits_non_zero(self):
         client = create_standalone_client(self)
 
         builder = QuicPacketBuilder(
-            host_cid=client._peer_cid.cid,
+            host_cid=client._network_paths[0].peer_cid.cid,
             is_client=False,
             max_datagram_size=SMALLEST_MAX_DATAGRAM_SIZE,
-            peer_cid=client.host_cid,
+            peer_cid=client._network_paths[0].host_cid,
             version=client._version,
         )
         crypto = CryptoPair()
         crypto.setup_initial(
-            client._peer_cid.cid, is_client=False, version=client._version
+            client._network_paths[0].peer_cid.cid, is_client=False, version=client._version
         )
         crypto.encrypt_packet_real = crypto.encrypt_packet
 
@@ -1335,7 +1362,7 @@ class QuicConnectionTest(TestCase):
         buf.push_bytes(bytes(builder.remaining_flight_space))
 
         for datagram in builder.flush()[0]:
-            client.receive_datagram(datagram, SERVER_ADDR, now=time.time())
+            client.receive_datagram(datagram, SERVER_ADDR, addr_local=CLIENT_ADDR, now=time.time())
         self.assertEqual(drop(client), 1)
         self.assertEqual(
             client._close_event,
@@ -1350,22 +1377,22 @@ class QuicConnectionTest(TestCase):
         client = create_standalone_client(self)
 
         builder = QuicPacketBuilder(
-            host_cid=client._peer_cid.cid,
+            host_cid=client._network_paths[0].peer_cid.cid,
             is_client=False,
             max_datagram_size=SMALLEST_MAX_DATAGRAM_SIZE,
-            peer_cid=client.host_cid,
+            peer_cid=client._network_paths[0].host_cid,
             version=0x1A2A3A4A,
         )
         crypto = CryptoPair()
         crypto.setup_initial(
-            client._peer_cid.cid, is_client=False, version=client._version
+            client._network_paths[0].peer_cid.cid, is_client=False, version=client._version
         )
         builder.start_packet(QuicPacketType.INITIAL, crypto)
         buf = builder.start_frame(QuicFrameType.PADDING)
         buf.push_bytes(bytes(builder.remaining_flight_space))
 
         for datagram in builder.flush()[0]:
-            client.receive_datagram(datagram, SERVER_ADDR, now=time.time())
+            client.receive_datagram(datagram, SERVER_ADDR, addr_local=CLIENT_ADDR, now=time.time())
         self.assertEqual(drop(client), 0)
 
         self.assertPacketDropped(client, "unsupported_version")
@@ -1373,34 +1400,26 @@ class QuicConnectionTest(TestCase):
     def test_receive_datagram_retry(self):
         client = create_standalone_client(self)
 
-        client.receive_datagram(
-            encode_quic_retry(
-                version=client._version,
-                source_cid=binascii.unhexlify("85abb547bf28be97"),
-                destination_cid=client.host_cid,
-                original_destination_cid=client._peer_cid.cid,
-                retry_token=bytes(16),
-            ),
-            SERVER_ADDR,
-            now=time.time(),
-        )
+        client.receive_datagram(encode_quic_retry(
+            version=client._version,
+            source_cid=binascii.unhexlify("85abb547bf28be97"),
+            destination_cid=client._network_paths[0].host_cid,
+            original_destination_cid=client._network_paths[0].peer_cid.cid,
+            retry_token=bytes(16),
+        ), SERVER_ADDR, addr_local=CLIENT_ADDR, now=time.time())
         self.assertEqual(drop(client), 1)
 
     def test_receive_datagram_retry_wrong_destination_cid(self):
         client = create_standalone_client(self)
 
         # The client does not reply to a retry packet with a wrong destination CID.
-        client.receive_datagram(
-            encode_quic_retry(
-                version=client._version,
-                source_cid=binascii.unhexlify("85abb547bf28be97"),
-                destination_cid=binascii.unhexlify("c98343fe8f5f0ff4"),
-                original_destination_cid=client._peer_cid.cid,
-                retry_token=bytes(16),
-            ),
-            SERVER_ADDR,
-            now=time.time(),
-        )
+        client.receive_datagram(encode_quic_retry(
+            version=client._version,
+            source_cid=binascii.unhexlify("85abb547bf28be97"),
+            destination_cid=binascii.unhexlify("c98343fe8f5f0ff4"),
+            original_destination_cid=client._network_paths[0].peer_cid.cid,
+            retry_token=bytes(16),
+        ), SERVER_ADDR, addr_local=CLIENT_ADDR, now=time.time())
         self.assertEqual(drop(client), 0)
 
         self.assertPacketDropped(client, "unknown_connection_id")
@@ -1408,18 +1427,14 @@ class QuicConnectionTest(TestCase):
     def test_receive_datagram_retry_wrong_integrity_tag(self):
         client = create_standalone_client(self)
 
-        client.receive_datagram(
-            encode_quic_retry(
-                version=client._version,
-                source_cid=binascii.unhexlify("85abb547bf28be97"),
-                destination_cid=client.host_cid,
-                original_destination_cid=client._peer_cid.cid,
-                retry_token=bytes(16),
-            )[0:-16]
-            + bytes(16),
-            SERVER_ADDR,
-            now=time.time(),
-        )
+        client.receive_datagram(encode_quic_retry(
+            version=client._version,
+            source_cid=binascii.unhexlify("85abb547bf28be97"),
+            destination_cid=client._network_paths[0].host_cid,
+            original_destination_cid=client._network_paths[0].peer_cid.cid,
+            retry_token=bytes(16),
+        )[0:-16]
+        + bytes(16), SERVER_ADDR, addr_local=CLIENT_ADDR, now=time.time())
         self.assertEqual(drop(client), 0)
 
     def test_handle_ack_frame_ecn(self):
@@ -1762,9 +1777,9 @@ class QuicConnectionTest(TestCase):
                 buf,
             )
 
-            self.assertEqual(client._peer_cid.sequence_number, 0)
+            self.assertEqual(client._network_paths[0].peer_cid.sequence_number, 0)
             self.assertEqual(
-                sequence_numbers(client._peer_cid_available), [1, 2, 3, 4, 5, 6, 7]
+                sequence_numbers(client._network_paths[0].peer_cid_available), [1, 2, 3, 4, 5, 6, 7]
             )
 
     def test_handle_new_connection_id_over_limit(self):
@@ -1797,9 +1812,9 @@ class QuicConnectionTest(TestCase):
                 buf,
             )
 
-            self.assertEqual(client._peer_cid.sequence_number, 2)
+            self.assertEqual(client._network_paths[0].peer_cid.sequence_number, 2)
             self.assertEqual(
-                sequence_numbers(client._peer_cid_available), [3, 4, 5, 6, 7, 8]
+                sequence_numbers(client._network_paths[0].peer_cid_available), [3, 4, 5, 6, 7, 8]
             )
 
     def test_handle_new_connection_id_with_retire_prior_to_lower(self):
@@ -1813,8 +1828,8 @@ class QuicConnectionTest(TestCase):
                 buf,
             )
 
-            self.assertEqual(client._peer_cid.sequence_number, 80)
-            self.assertEqual(sequence_numbers(client._peer_cid_available), [])
+            self.assertEqual(client._network_paths[0].peer_cid.sequence_number, 80)
+            self.assertEqual(sequence_numbers(client._network_paths[0].peer_cid_available), [])
 
             buf = new_connection_id(sequence_number=30, retire_prior_to=30)
 
@@ -1825,8 +1840,8 @@ class QuicConnectionTest(TestCase):
                 buf,
             )
 
-            self.assertEqual(client._peer_cid.sequence_number, 80)
-            self.assertEqual(sequence_numbers(client._peer_cid_available), [])
+            self.assertEqual(client._network_paths[0].peer_cid.sequence_number, 80)
+            self.assertEqual(sequence_numbers(client._network_paths[0].peer_cid_available), [])
 
     def test_handle_excessive_new_connection_id_retires(self):
         with client_and_server() as (client, server):
@@ -1845,7 +1860,7 @@ class QuicConnectionTest(TestCase):
 
             # So far, so good!  We should be at the (default) limit of 4*8 pending
             # retirements.
-            self.assertEqual(len(client._retire_connection_ids), 32)
+            self.assertEqual(len(client._network_paths[0].retire_connection_ids), 32)
 
             # Now we will go one too many!
             sequence_number = 8 + 25
@@ -1961,7 +1976,7 @@ class QuicConnectionTest(TestCase):
 
             # server sends PATH_CHALLENGE and receives PATH_RESPONSE
             for data, addr in server.datagrams_to_send(now=time.time()):
-                client.receive_datagram(data, SERVER_ADDR, now=time.time())
+                client.receive_datagram(data, SERVER_ADDR, addr_local=CLIENT_ADDR, now=time.time())
             for data, addr in client.datagrams_to_send(now=time.time()):
                 server.receive_datagram(data, ("1.2.3.4", 2345), now=time.time())
 
@@ -1988,7 +2003,7 @@ class QuicConnectionTest(TestCase):
             # server sends PATH_CHALLENGE and receives PATH_RESPONSE on the 1234
             # path instead of the expected 2345 path.
             for data, addr in server.datagrams_to_send(now=time.time()):
-                client.receive_datagram(data, SERVER_ADDR, now=time.time())
+                client.receive_datagram(data, SERVER_ADDR, addr_local=CLIENT_ADDR, now=time.time())
             for data, addr in client.datagrams_to_send(now=time.time()):
                 server.receive_datagram(data, ("1.2.3.4", 1234), now=time.time())
 
@@ -2220,7 +2235,7 @@ class QuicConnectionTest(TestCase):
     def test_handle_retire_connection_id_frame(self):
         with client_and_server() as (client, server):
             self.assertEqual(
-                sequence_numbers(client._host_cids), [0, 1, 2, 3, 4, 5, 6, 7]
+                sequence_numbers(client._network_paths[0].host_cids), [0, 1, 2, 3, 4, 5, 6, 7]
             )
 
             # client receives RETIRE_CONNECTION_ID
@@ -2230,13 +2245,13 @@ class QuicConnectionTest(TestCase):
                 Buffer(data=b"\x02"),
             )
             self.assertEqual(
-                sequence_numbers(client._host_cids), [0, 1, 3, 4, 5, 6, 7, 8]
+                sequence_numbers(client._network_paths[0].host_cids), [0, 1, 3, 4, 5, 6, 7, 8]
             )
 
     def test_handle_retire_connection_id_frame_current_cid(self):
         with client_and_server() as (client, server):
             self.assertEqual(
-                sequence_numbers(client._host_cids), [0, 1, 2, 3, 4, 5, 6, 7]
+                sequence_numbers(client._network_paths[0].host_cids), [0, 1, 2, 3, 4, 5, 6, 7]
             )
 
             # client receives RETIRE_CONNECTION_ID for the current CID
@@ -2254,13 +2269,13 @@ class QuicConnectionTest(TestCase):
                 cm.exception.reason_phrase, "Cannot retire current connection ID"
             )
             self.assertEqual(
-                sequence_numbers(client._host_cids), [0, 1, 2, 3, 4, 5, 6, 7]
+                sequence_numbers(client._network_paths[0].host_cids), [0, 1, 2, 3, 4, 5, 6, 7]
             )
 
     def test_handle_retire_connection_id_frame_invalid_sequence_number(self):
         with client_and_server() as (client, server):
             self.assertEqual(
-                sequence_numbers(client._host_cids), [0, 1, 2, 3, 4, 5, 6, 7]
+                sequence_numbers(client._network_paths[0].host_cids), [0, 1, 2, 3, 4, 5, 6, 7]
             )
 
             # client receives RETIRE_CONNECTION_ID
@@ -2278,7 +2293,7 @@ class QuicConnectionTest(TestCase):
                 cm.exception.reason_phrase, "Cannot retire unknown connection ID"
             )
             self.assertEqual(
-                sequence_numbers(client._host_cids), [0, 1, 2, 3, 4, 5, 6, 7]
+                sequence_numbers(client._network_paths[0].host_cids), [0, 1, 2, 3, 4, 5, 6, 7]
             )
 
     def test_handle_stop_sending_frame(self):
@@ -2818,16 +2833,16 @@ class QuicConnectionTest(TestCase):
             # Check congestion control. We do not check the congestion
             # window too strictly as its exact value depends on the size
             # of our ACKs, which depends on the execution time.
-            self.assertEqual(client._loss.bytes_in_flight, 0)
-            self.assertGreaterEqual(client._loss.congestion_window, 13472)
-            self.assertLessEqual(client._loss.congestion_window, 13540)
+            self.assertEqual(client._network_paths[0].loss.bytes_in_flight, 0)
+            self.assertGreaterEqual(client._network_paths[0].loss.congestion_window, 13472)
+            self.assertLessEqual(client._network_paths[0].loss.congestion_window, 13540)
 
             # artificially raise received data counter
             client._local_max_data_used = client._local_max_data
             self.assertEqual(server._remote_max_data, 1048576)
 
             # artificially raise bytes in flight
-            client._loss._cc.bytes_in_flight = client._loss.congestion_window
+            client._network_paths[0].loss._cc.bytes_in_flight = client._network_paths[0].loss.congestion_window
 
             # MAX_DATA is not sent due to congestion control
             self.assertEqual(drop(client), 0)
@@ -3150,15 +3165,11 @@ class QuicConnectionTest(TestCase):
         client = create_standalone_client(self)
 
         # no common version, no retry
-        client.receive_datagram(
-            encode_quic_version_negotiation(
-                source_cid=client._peer_cid.cid,
-                destination_cid=client.host_cid,
-                supported_versions=[0x1A2A3A4A],
-            ),
-            SERVER_ADDR,
-            now=time.time(),
-        )
+        client.receive_datagram(encode_quic_version_negotiation(
+            source_cid=client._network_paths[0].peer_cid.cid,
+            destination_cid=client._network_paths[0].host_cid,
+            supported_versions=[0x1A2A3A4A],
+        ), SERVER_ADDR, addr_local=CLIENT_ADDR, now=time.time())
         self.assertEqual(drop(client), 0)
 
         event = client.next_event()
@@ -3173,30 +3184,22 @@ class QuicConnectionTest(TestCase):
         client = create_standalone_client(self)
 
         # version negotiation contains the client's version
-        client.receive_datagram(
-            encode_quic_version_negotiation(
-                source_cid=client._peer_cid.cid,
-                destination_cid=client.host_cid,
-                supported_versions=[client._version],
-            ),
-            SERVER_ADDR,
-            now=time.time(),
-        )
+        client.receive_datagram(encode_quic_version_negotiation(
+            source_cid=client._network_paths[0].peer_cid.cid,
+            destination_cid=client._network_paths[0].host_cid,
+            supported_versions=[client._version],
+        ), SERVER_ADDR, addr_local=CLIENT_ADDR, now=time.time())
         self.assertEqual(drop(client), 0)
 
     def test_version_negotiation_ignore_server(self):
         server = create_standalone_server(self)
 
         # Servers do not expect version negotiation packets.
-        server.receive_datagram(
-            encode_quic_version_negotiation(
-                source_cid=server._peer_cid.cid,
-                destination_cid=server.host_cid,
-                supported_versions=[QuicProtocolVersion.VERSION_1],
-            ),
-            CLIENT_ADDR,
-            now=time.time(),
-        )
+        server.receive_datagram(encode_quic_version_negotiation(
+            source_cid=server._network_paths[0].peer_cid.cid,
+            destination_cid=server._network_paths[0].host_cid,
+            supported_versions=[QuicProtocolVersion.VERSION_1],
+        ), CLIENT_ADDR, addr_local=SERVER_ADDR, now=time.time())
         self.assertPacketDropped(server, "unexpected_packet")
 
     def test_version_negotiation_ok(self):
@@ -3209,29 +3212,25 @@ class QuicConnectionTest(TestCase):
         )
 
         # found a common version, retry
-        client.receive_datagram(
-            encode_quic_version_negotiation(
-                source_cid=client._peer_cid.cid,
-                destination_cid=client.host_cid,
-                supported_versions=[0x1A2A3A4A],
-            ),
-            SERVER_ADDR,
-            now=time.time(),
-        )
+        client.receive_datagram(encode_quic_version_negotiation(
+            source_cid=client._network_paths[0].peer_cid.cid,
+            destination_cid=client._network_paths[0].host_cid,
+            supported_versions=[0x1A2A3A4A],
+        ), SERVER_ADDR, addr_local=CLIENT_ADDR, now=time.time())
         self.assertEqual(drop(client), 1)
 
     def test_write_connection_close_early(self):
         client = create_standalone_client(self)
 
         builder = QuicPacketBuilder(
-            host_cid=client.host_cid,
+            host_cid=client._network_paths[0].host_cid,
             is_client=True,
             max_datagram_size=SMALLEST_MAX_DATAGRAM_SIZE,
-            peer_cid=client._peer_cid.cid,
+            peer_cid=client._network_paths[0].peer_cid.cid,
             version=client._version,
         )
         crypto = CryptoPair()
-        crypto.setup_initial(client.host_cid, is_client=True, version=client._version)
+        crypto.setup_initial(client._network_paths[0].host_cid, is_client=True, version=client._version)
         builder.start_packet(QuicPacketType.INITIAL, crypto)
         client._write_connection_close_frame(
             builder=builder,
