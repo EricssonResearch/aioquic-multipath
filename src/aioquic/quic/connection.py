@@ -421,9 +421,9 @@ class QuicConnection:
             0x1E: (self._handle_handshake_done_frame, EPOCHS("1")),
             0x30: (self._handle_datagram_frame, EPOCHS("01")),
             0x31: (self._handle_datagram_frame, EPOCHS("01")),
-            0x15228c00: (self._handle_path_ack_frame, EPOCHS("1")),
-            0x15228c01: (self._handle_path_ack_frame, EPOCHS("1")),
-            0x15228c09: (self._handle_path_new_connection_id_frame, EPOCHS("1")),
+            0x3e: (self._handle_path_ack_frame, EPOCHS("1")),
+            0x3f: (self._handle_path_ack_frame, EPOCHS("1")),
+            0x3e78: (self._handle_path_new_connection_id_frame, EPOCHS("1")),
 
         }
 
