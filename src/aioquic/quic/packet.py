@@ -43,10 +43,10 @@ class QuicErrorCode(IntEnum):
     AEAD_LIMIT_REACHED = 0xF
     VERSION_NEGOTIATION_ERROR = 0x11
     CRYPTO_ERROR = 0x100
-    APPLICATION_ABANDON = 0x004150504142414e
-    RESOURCE_LIMIT_REACHED = 0x0052534c494d4954
-    UNSTABLE_INTERFACE = 0x00554e5f494e5446
-    NO_CID_AVAILABLE = 0x004e4f5f4349445f
+    APPLICATION_ABANDON = 0x3e
+    RESOURCE_LIMIT_REACHED = 0x3e75
+    UNSTABLE_INTERFACE = 0x3e76
+    NO_CID_AVAILABLE = 0x3e77
 
 
 class QuicPacketType(Enum):
@@ -391,7 +391,7 @@ PARAMS = {
     0x07: ("initial_max_stream_data_uni", int),
     0x08: ("initial_max_streams_bidi", int),
     0x09: ("initial_max_streams_uni", int),
-    0x0f739bbc1b666d0d: ("initial_max_path_id", int),
+    0x3e: ("initial_max_path_id", int),
     0x0A: ("ack_delay_exponent", int),
     0x0B: ("max_ack_delay", int),
     0x0C: ("disable_active_migration", bool),
@@ -562,16 +562,16 @@ class QuicFrameType(IntEnum):
     HANDSHAKE_DONE = 0x1E
     DATAGRAM = 0x30
     DATAGRAM_WITH_LENGTH = 0x31
-    PATH_ABANDON = 0x15228c05
-    PATH_AVAILABLE = 0x15228c08
-    PATH_BACKUP = 0x15228c07
-    PATHS_BLOCKED = 0x15228c0d
-    PATH_CIDS_BLOCKED =  0x15228c0e
-    MAX_PATH_ID = 0x15228c0c
-    PATH_ACK = 0x15228c00
-    PATH_ACK_ECN = 0x15228c01
-    PATH_NEW_CONNECTION_ID = 0x15228c09
-    PATH_RETIRE_CONNECTION_ID = 0x15228c0a
+    PATH_ABANDON = 0x3e75
+    PATH_AVAILABLE = 0x3e77
+    PATH_BACKUP = 0x3e76
+    PATHS_BLOCKED = 0x3e7b
+    PATH_CIDS_BLOCKED =  0x3e7c
+    MAX_PATH_ID = 0x3e7a
+    PATH_ACK = 0x3e
+    PATH_ACK_ECN = 0x3f
+    PATH_NEW_CONNECTION_ID = 0x3e78
+    PATH_RETIRE_CONNECTION_ID = 0x3e79
 
 
 
