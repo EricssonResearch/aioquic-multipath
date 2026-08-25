@@ -111,7 +111,7 @@ TRANSPORT_CLOSE_FRAME_CAPACITY = 1 + 3 * UINT_VAR_MAX_SIZE  # + reason length
 # frame sizes multipath QUIC
 MAX_PATH_ID_FRAME_CAPACITY = 4 + 1 * UINT_VAR_MAX_SIZE
 PATH_ACK_FRAME_CAPACITY = 64  # FIXME: this is arbitrary!
-PATH_NEW_CONNECTIION_ID_FRAME_CAPACITY = 4 + 3 * UINT_VAR_MAX_SIZE + 1 + 20 + 16 # FIXME: adapt when types are standardized / fixed
+PATH_NEW_CONNECTION_ID_FRAME_CAPACITY = 4 + 3 * UINT_VAR_MAX_SIZE + 1 + 20 + 16 # FIXME: adapt when types are standardized / fixed
 PATH_RETIRE_CONNECTION_ID_FRAME_CAPACITY = 4 + 2 * UINT_VAR_MAX_SIZE
 PATH_ABANDON_FRAME_CAPACITY = 4 + 3 * UINT_VAR_MAX_SIZE # + reason length # FIXME: adapt when types are standardized / fixed
 PATH_AVAILABLE_FRAME_CAPACITY = 4 + 2 * UINT_VAR_MAX_SIZE
@@ -2105,7 +2105,7 @@ class QuicConnection:
         self, context: QuicReceiveContext, frame_type: int, buf: Buffer
     ) -> None:
         """
-        Handle a PATH_NEW_CONNECTIION_ID frame.
+        Handle a PATH_NEW_CONNECTION_ID frame.
         """
         path_id = buf.pull_uint_var()
         sequence_number = buf.pull_uint_var()
@@ -3694,8 +3694,8 @@ class QuicConnection:
         retire_prior_to = 0  # FIXME
 
         buf = builder.start_frame(
-            QuicFrameType.PATH_NEW_CONNECTIION_ID,
-            capacity=PATH_NEW_CONNECTIION_ID_FRAME_CAPACITY,
+            QuicFrameType.PATH_NEW_CONNECTION_ID,
+            capacity=PATH_NEW_CONNECTION_ID_FRAME_CAPACITY,
             handler=self._on_new_connection_id_delivery,
             handler_args=(connection_id,),
         )
