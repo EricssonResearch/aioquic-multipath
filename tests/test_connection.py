@@ -14,8 +14,10 @@ from aioquic.quic.connection import (
     MAX_PENDING_CRYPTO,
     STREAM_COUNT_MAX,
     NetworkAddress,
+    PathTuple,
     QuicConnection,
     QuicConnectionError,
+    QuicConnectionId,
     QuicNetworkPath,
     QuicReceiveContext,
 )
@@ -2280,6 +2282,154 @@ class QuicConnectionTest(TestCase):
             self.assertEqual(
                 sequence_numbers(client._network_paths[0].host_cids), [0, 1, 2, 3, 4, 5, 6, 7]
             )
+
+    def add_second_path(self, connection: QuicConnection, path_id: int = 1) -> None:
+        """
+        Directly create a second, already-validated network path on
+        `connection`, with a handful of host connection IDs, so that
+        PATH_-prefixed, per-path frame handlers can be exercised without
+        driving a full multipath handshake.
+        """
+        host_cid = QuicConnectionId(
+            cid=bytes([path_id]) * 8,
+            sequence_number=0,
+            stateless_reset_token=bytes(16),
+        )
+        peer_cid = QuicConnectionId(
+            cid=bytes([path_id + 0x10]) * 8, sequence_number=0
+        )
+        connection._path_ids[host_cid.cid] = path_id
+        connection._create_network_path(
+            path_id=path_id,
+            host_cid=host_cid,
+            peer_cid=peer_cid,
+            path_tuple=PathTuple(
+                local_addr=CLIENT_ADDR, remote_addr=SERVER_ADDR, is_validated=True
+            ),
+        )
+        connection._replenish_connection_ids(path_id)
+
+    def test_handle_path_retire_connection_id_frame(self):
+        with client_and_server() as (client, server):
+            self.add_second_path(client)
+            self.assertEqual(
+                sequence_numbers(client._network_paths[1].host_cids),
+                [0, 1, 2, 3, 4, 5, 6, 7],
+            )
+
+            # client receives PATH_RETIRE_CONNECTION_ID for path 1, CID 2
+            buf = Buffer(capacity=16)
+            buf.push_uint_var(1)  # path ID
+            buf.push_uint_var(2)  # sequence number
+            buf.seek(0)
+            client._handle_path_retire_connection_id_frame(
+                client_receive_context(client),
+                QuicFrameType.PATH_RETIRE_CONNECTION_ID,
+                buf,
+            )
+            self.assertEqual(
+                sequence_numbers(client._network_paths[1].host_cids),
+                [0, 1, 3, 4, 5, 6, 7, 8],
+            )
+            # path 0 must be unaffected
+            self.assertEqual(
+                sequence_numbers(client._network_paths[0].host_cids),
+                [0, 1, 2, 3, 4, 5, 6, 7],
+            )
+
+    def test_handle_path_retire_connection_id_frame_current_cid(self):
+        with client_and_server() as (client, server):
+            self.add_second_path(client)
+
+            # client receives PATH_RETIRE_CONNECTION_ID for path 1's
+            # currently-active CID (sequence number 0)
+            buf = Buffer(capacity=16)
+            buf.push_uint_var(1)
+            buf.push_uint_var(0)
+            buf.seek(0)
+            with self.assertRaises(QuicConnectionError) as cm:
+                client._handle_path_retire_connection_id_frame(
+                    client_receive_context(client),
+                    QuicFrameType.PATH_RETIRE_CONNECTION_ID,
+                    buf,
+                )
+            self.assertEqual(cm.exception.error_code, QuicErrorCode.PROTOCOL_VIOLATION)
+            self.assertEqual(
+                cm.exception.frame_type, QuicFrameType.PATH_RETIRE_CONNECTION_ID
+            )
+            self.assertEqual(
+                cm.exception.reason_phrase, "Cannot retire current connection ID"
+            )
+            self.assertEqual(
+                sequence_numbers(client._network_paths[1].host_cids),
+                [0, 1, 2, 3, 4, 5, 6, 7],
+            )
+
+    def test_handle_path_retire_connection_id_frame_invalid_sequence_number(self):
+        with client_and_server() as (client, server):
+            self.add_second_path(client)
+
+            # client receives PATH_RETIRE_CONNECTION_ID for a sequence
+            # number that was never issued on path 1
+            buf = Buffer(capacity=16)
+            buf.push_uint_var(1)
+            buf.push_uint_var(8)
+            buf.seek(0)
+            with self.assertRaises(QuicConnectionError) as cm:
+                client._handle_path_retire_connection_id_frame(
+                    client_receive_context(client),
+                    QuicFrameType.PATH_RETIRE_CONNECTION_ID,
+                    buf,
+                )
+            self.assertEqual(cm.exception.error_code, QuicErrorCode.PROTOCOL_VIOLATION)
+            self.assertEqual(
+                cm.exception.frame_type, QuicFrameType.PATH_RETIRE_CONNECTION_ID
+            )
+            self.assertEqual(
+                cm.exception.reason_phrase, "Cannot retire unknown connection ID"
+            )
+            self.assertEqual(
+                sequence_numbers(client._network_paths[1].host_cids),
+                [0, 1, 2, 3, 4, 5, 6, 7],
+            )
+
+    def test_handle_path_retire_connection_id_frame_unknown_path(self):
+        with client_and_server() as (client, server):
+            # client receives PATH_RETIRE_CONNECTION_ID for a path ID that
+            # does not exist; this must be silently discarded, not raise.
+            buf = Buffer(capacity=16)
+            buf.push_uint_var(42)
+            buf.push_uint_var(0)
+            buf.seek(0)
+            client._handle_path_retire_connection_id_frame(
+                client_receive_context(client),
+                QuicFrameType.PATH_RETIRE_CONNECTION_ID,
+                buf,
+            )
+
+    def test_write_path_retire_connection_id_frame(self):
+        with client_and_server() as (client, server):
+            self.add_second_path(client)
+            network_path = client._network_paths[1]
+
+            # simulate a pending retirement queued on path 1 and force
+            # multipath-negotiated behaviour for the write path
+            network_path.retire_connection_ids.append(3)
+            client._multipath_negotiated = True
+
+            builder = QuicPacketBuilder(
+                host_cid=network_path.host_cid,
+                is_client=True,
+                max_datagram_size=SMALLEST_MAX_DATAGRAM_SIZE,
+                peer_cid=network_path.peer_cid.cid,
+                version=client._version,
+            )
+            crypto = client._cryptos[tls.Epoch.ONE_RTT]
+            builder.start_packet(QuicPacketType.ONE_RTT, crypto)
+            client._write_path_retire_connection_id_frame(
+                builder=builder, path_id=1, sequence_number=3
+            )
+            self.assertFalse(builder.packet_is_empty)
 
     def test_handle_stop_sending_frame(self):
         with client_and_server() as (client, server):

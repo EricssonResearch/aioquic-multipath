@@ -424,6 +424,7 @@ class QuicConnection:
             0x3e: (self._handle_path_ack_frame, EPOCHS("1")),
             0x3f: (self._handle_path_ack_frame, EPOCHS("1")),
             0x3e78: (self._handle_path_new_connection_id_frame, EPOCHS("1")),
+            0x3e79: (self._handle_path_retire_connection_id_frame, EPOCHS("1")),
 
         }
 
@@ -2520,6 +2521,63 @@ class QuicConnection:
         # issue a new connection ID
         self._replenish_connection_ids(context.path_id)
 
+    def _handle_path_retire_connection_id_frame(
+        self, context: QuicReceiveContext, frame_type: int, buf: Buffer
+    ) -> None:
+        """
+        Handle a PATH_RETIRE_CONNECTION_ID frame.
+        """
+        path_id = buf.pull_uint_var()
+        sequence_number = buf.pull_uint_var()
+
+        # log frame
+        if self._quic_logger is not None:
+            context.quic_logger_frames.append(
+                self._quic_logger.encode_path_retire_connection_id_frame(
+                    path_id, sequence_number
+                )
+            )
+
+        if path_id not in self._network_paths and path_id not in self._network_paths_stock:
+            self._logger.info(
+                f"Discard PATH_RETIRE_CONNECTION_ID frame for unknown path id {path_id}."
+            )
+            return
+
+        network_path = self._network_paths.get(path_id) or self._network_paths_stock[path_id]
+
+        if sequence_number >= network_path.host_cid_seq:
+            raise QuicConnectionError(
+                error_code=QuicErrorCode.PROTOCOL_VIOLATION,
+                frame_type=frame_type,
+                reason_phrase="Cannot retire unknown connection ID",
+            )
+
+        # find the connection ID by sequence number
+        for index, connection_id in enumerate(network_path.host_cids):
+            if connection_id.sequence_number == sequence_number:
+                if connection_id.cid == network_path.host_cid:
+                    raise QuicConnectionError(
+                        error_code=QuicErrorCode.PROTOCOL_VIOLATION,
+                        frame_type=frame_type,
+                        reason_phrase="Cannot retire current connection ID",
+                    )
+                self._logger.debug(
+                    "Peer retiring CID %s (%d) for path %d",
+                    dump_cid(connection_id.cid),
+                    connection_id.sequence_number,
+                    path_id,
+                )
+                del network_path.host_cids[index]
+                del self._path_ids[connection_id.cid]
+                self._events.append(
+                    events.ConnectionIdRetired(connection_id=connection_id.cid)
+                )
+                break
+
+        # issue a new connection ID
+        self._replenish_connection_ids(path_id)
+
     def _handle_stop_sending_frame(
         self, context: QuicReceiveContext, frame_type: int, buf: Buffer
     ) -> None:
@@ -3463,18 +3521,24 @@ class QuicConnection:
                                     path_id=np.path_id
                                 )
 
-                # RETIRE_CONNECTION_ID
-                # The base RETIRE_CONNECTION_ID frame is only valid for path
-                # ID 0 (see draft-ietf-quic-multipath Section 3.2). CID
-                # retirement on other paths requires PATH_RETIRE_CONNECTION_ID,
-                # which is not yet implemented.
-                if network_path.path_id == 0:
-                    for sequence_number in network_path.retire_connection_ids[:]:
+                # RETIRE_CONNECTION_ID / PATH_RETIRE_CONNECTION_ID
+                # Once multipath is negotiated, PATH_RETIRE_CONNECTION_ID is
+                # preferred for all paths, including path 0 (SHOULD, see
+                # draft-ietf-quic-multipath Section 3.2), matching the same
+                # pattern used for PATH_ACK/PATH_NEW_CONNECTION_ID above.
+                for sequence_number in network_path.retire_connection_ids[:]:
+                    if self._multipath_negotiated:
+                        self._write_path_retire_connection_id_frame(
+                            builder=builder,
+                            path_id=network_path.path_id,
+                            sequence_number=sequence_number,
+                        )
+                    else:
                         self._write_retire_connection_id_frame(
                             builder=builder,
                             sequence_number=sequence_number,
                         )
-                        network_path.retire_connection_ids.pop(0)
+                    network_path.retire_connection_ids.pop(0)
 
                 # STREAMS_BLOCKED
                 if self._streams_blocked_pending:
@@ -3983,6 +4047,26 @@ class QuicConnection:
         if self._quic_logger is not None:
             builder.quic_logger_frames.append(
                 self._quic_logger.encode_retire_connection_id_frame(sequence_number)
+            )
+
+    def _write_path_retire_connection_id_frame(
+        self, builder: QuicPacketBuilder, path_id: int, sequence_number: int
+    ) -> None:
+        buf = builder.start_frame(
+            QuicFrameType.PATH_RETIRE_CONNECTION_ID,
+            capacity=PATH_RETIRE_CONNECTION_ID_FRAME_CAPACITY,
+            handler=self._on_retire_connection_id_delivery,
+            handler_args=(sequence_number, path_id),
+        )
+        buf.push_uint_var(path_id)
+        buf.push_uint_var(sequence_number)
+
+        # log frame
+        if self._quic_logger is not None:
+            builder.quic_logger_frames.append(
+                self._quic_logger.encode_path_retire_connection_id_frame(
+                    path_id, sequence_number
+                )
             )
 
     def _write_stop_sending_frame(
