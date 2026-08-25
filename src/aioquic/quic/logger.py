@@ -186,6 +186,15 @@ class QuicLoggerTrace:
             "sequence_number": sequence_number,
         }
 
+    def encode_path_retire_connection_id_frame(
+        self, path_id: int, sequence_number: int
+    ) -> dict:
+        return {
+            "frame_type": "path_retire_connection_id",
+            "path_id": path_id,
+            "sequence_number": sequence_number,
+        }
+
     def encode_stream_data_blocked_frame(self, limit: int, stream_id: int) -> dict:
         return {
             "frame_type": "stream_data_blocked",
