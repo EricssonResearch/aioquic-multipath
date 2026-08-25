@@ -3464,11 +3464,17 @@ class QuicConnection:
                                 )
 
                 # RETIRE_CONNECTION_ID
-                for sequence_number in network_path.retire_connection_ids[:]:
-                    self._write_retire_connection_id_frame(
-                        builder=builder, sequence_number=sequence_number
-                    )
-                    network_path.retire_connection_ids.pop(0)
+                # The base RETIRE_CONNECTION_ID frame is only valid for path
+                # ID 0 (see draft-ietf-quic-multipath Section 3.2). CID
+                # retirement on other paths requires PATH_RETIRE_CONNECTION_ID,
+                # which is not yet implemented.
+                if network_path.path_id == 0:
+                    for sequence_number in network_path.retire_connection_ids[:]:
+                        self._write_retire_connection_id_frame(
+                            builder=builder,
+                            sequence_number=sequence_number,
+                        )
+                        network_path.retire_connection_ids.pop(0)
 
                 # STREAMS_BLOCKED
                 if self._streams_blocked_pending:
@@ -3962,11 +3968,14 @@ class QuicConnection:
     def _write_retire_connection_id_frame(
         self, builder: QuicPacketBuilder, sequence_number: int
     ) -> None:
+        # This frame is only valid for path ID 0 (see
+        # draft-ietf-quic-multipath Section 3.2); callers are expected to
+        # only invoke this for path 0's retirements.
         buf = builder.start_frame(
             QuicFrameType.RETIRE_CONNECTION_ID,
             capacity=RETIRE_CONNECTION_ID_CAPACITY,
             handler=self._on_retire_connection_id_delivery,
-            handler_args=(sequence_number,),
+            handler_args=(sequence_number, 0),
         )
         buf.push_uint_var(sequence_number)
 
