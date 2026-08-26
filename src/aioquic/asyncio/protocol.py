@@ -153,7 +153,7 @@ class QuicConnectionProtocol(asyncio.DatagramProtocol):
 
         The previous connection ID will be retired.
         """
-        self._quic.change_connection_id()
+        self._quic._network_paths[0].change_connection_id()
         self.transmit()
 
     def close(
