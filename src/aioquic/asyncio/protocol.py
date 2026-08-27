@@ -3,7 +3,7 @@ import binascii
 import logging
 import socket
 import sys
-from typing import Any, Callable, List, Optional, Text, Tuple, Union, cast
+from typing import Any, Callable, Optional, Text, Union, cast
 
 from ..quic import events
 from ..quic.connection import NetworkAddress, QuicConnection
@@ -18,7 +18,7 @@ def dump_cid(cid: bytes) -> str:
     return binascii.hexlify(cid).decode("ascii")
 
 class QuicConnectionProtocolAdapter(logging.LoggerAdapter):
-    def process(self, msg: str, kwargs: Any) -> Tuple[str, Any]:
+    def process(self, msg: str, kwargs: Any) -> tuple[str, Any]:
         return "[%s] %s" % (self.extra["id"], msg), kwargs
 
 class ProtocolWrapper(asyncio.DatagramProtocol):
@@ -39,7 +39,7 @@ class TransportWrapper(asyncio.DatagramTransport):
         self.local_addr = local_addr
         self._transport = transport
     
-    async def create_transport(self, loop, parent_protocol) -> Tuple[asyncio.DatagramTransport, asyncio.DatagramProtocol]:
+    async def create_transport(self, loop, parent_protocol) -> tuple[asyncio.DatagramTransport, asyncio.DatagramProtocol]:
         transport, _ = await loop.create_datagram_endpoint(lambda : ProtocolWrapper(self.datagram_received), self.local_addr)
         self.local_addr = transport.get_extra_info('sockname')[0:2]
         self._transport = transport
@@ -79,7 +79,7 @@ class QuicConnectionProtocol(asyncio.DatagramProtocol):
         self._timer: Optional[asyncio.TimerHandle] = None
         self._timer_at: Optional[float] = None
         self._transmit_task: Optional[asyncio.Handle] = None
-        self._transports:  List[TransportWrapper] = []
+        self._transports:  list[TransportWrapper] = []
 
         # callbacks
         self._connection_id_issued_handler: QuicConnectionIdHandler = lambda c: None
@@ -117,7 +117,7 @@ class QuicConnectionProtocol(asyncio.DatagramProtocol):
         remote_host: str,
         remote_port: int,
         local_host: str = "::",
-    ) -> Tuple[Optional[NetworkAddress], Optional[NetworkAddress]]:
+    ) -> tuple[Optional[NetworkAddress], Optional[NetworkAddress]]:
         """
         Add a network interface with new UDP socket.
         Returns actual local address and remote address.
@@ -275,7 +275,7 @@ class QuicConnectionProtocol(asyncio.DatagramProtocol):
     #def connection_made(self, transport: asyncio.BaseTransport) -> None:
     #    """:meta private:"""
     #    self._transports.append(cast(asyncio.DatagramTransport, transport))
-    def connection_made_server(self, transports: List[asyncio.BaseTransport]) -> None:
+    def connection_made_server(self, transports: list[asyncio.BaseTransport]) -> None:
         """:meta private:"""
         self._transports += transports
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
@@ -322,7 +322,7 @@ class QuicConnectionProtocol(asyncio.DatagramProtocol):
         self._stream_readers[stream_id] = reader
         return reader, writer
     
-    def _find_transport(self, addr: NetworkAddress, local_addr: NetworkAddress) -> Tuple[TransportWrapper, int]:
+    def _find_transport(self, addr: NetworkAddress, local_addr: NetworkAddress) -> tuple[TransportWrapper, int]:
         # check existing network paths
         for idx, transport in enumerate(self._transports):
             if addr in transport.addr:

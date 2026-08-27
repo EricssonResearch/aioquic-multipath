@@ -661,7 +661,7 @@ def push_ack_frame(buf: Buffer, rangeset: RangeSet, delay: int) -> int:
     return ranges
     
 
-def pull_path_ack_frame(buf: Buffer) -> Tuple[int, RangeSet, int]:
+def pull_path_ack_frame(buf: Buffer) -> tuple[int, RangeSet, int]:
     rangeset = RangeSet()
     path_id = buf.pull_uint_var()
     end = buf.pull_uint_var()  # largest acknowledged

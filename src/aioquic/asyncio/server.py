@@ -1,7 +1,7 @@
 import asyncio
 import os
 from functools import partial
-from typing import Callable, List, Optional, Text, Tuple, Union, cast
+from typing import Callable, Optional, Text, Union, cast
 
 from ..buffer import Buffer
 from ..quic.configuration import SMALLEST_MAX_DATAGRAM_SIZE, QuicConfiguration
@@ -37,7 +37,7 @@ class QuicServer(asyncio.DatagramProtocol):
         self._session_ticket_fetcher = session_ticket_fetcher
         self._session_ticket_handler = session_ticket_handler
         #self._transport: Optional[asyncio.DatagramTransport] = None
-        self._transports: List[TransportWrapper] = []
+        self._transports: list[TransportWrapper] = []
 
         self._stream_handler = stream_handler
 
@@ -65,7 +65,7 @@ class QuicServer(asyncio.DatagramProtocol):
     #    local_addr = transport.get_extra_info('sockname')[0:2]
     #    _transport = TransportWrapper(local_addr=local_addr, transport=transport)
     #    self._transports.append(_transport)
-    #def connection_made_server(self, transports: List[asyncio.BaseTransport]) -> None:
+    #def connection_made_server(self, transports: list[asyncio.BaseTransport]) -> None:
     #    """:meta private:"""
     #    print("connection_made1 in server")
     #    self._transports += transports
@@ -205,7 +205,7 @@ async def serve(
     session_ticket_handler: Optional[SessionTicketHandler] = None,
     retry: bool = False,
     stream_handler: QuicStreamHandler = None,
-    additional_interfaces: Optional[List[Tuple[str, int]]] = None,
+    additional_interfaces: Optional[list[tuple[str, int]]] = None,
 ) -> QuicServer:
     """
     Start a QUIC server at the given `host` and `port`.

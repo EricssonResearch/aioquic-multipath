@@ -2039,7 +2039,7 @@ class QuicConnectionTest(TestCase):
                     Buffer(data=challenge),
                 )
             self.assertEqual(
-                list(client._network_paths[0].remote_challenges),
+                list(client._network_paths[0].active_path_tuple.remote_challenges),
                 challenges[0:MAX_REMOTE_CHALLENGES],
             )
 

@@ -314,9 +314,9 @@ class QuicConnection:
         self._max_ack_delay = 0.025
         self._max_datagram_size = configuration.max_datagram_size
         self._max_path_id = configuration.max_path_id
-        self._network_paths: Dict[int, QuicNetworkPath] = {}
-        self._network_paths_stock: Dict[int, QuicNetworkPath] = {}
-        self._path_ids: Dict[bytes, int] = {}
+        self._network_paths: dict[int, QuicNetworkPath] = {}
+        self._network_paths_stock: dict[int, QuicNetworkPath] = {}
+        self._path_ids: dict[bytes, int] = {}
         self._peer_token = configuration.token
         self._quic_logger: Optional[QuicLoggerTrace] = None
         self._remote_ack_delay_exponent = 3
@@ -335,7 +335,7 @@ class QuicConnection:
         self._remote_version_information: Optional[QuicVersionInformation] = None
         self._retry_count = 0
         self._retry_source_connection_id = retry_source_connection_id
-#        self._spaces: Dict[tls.Epoch, QuicPacketSpace] = {}
+#        self._spaces: dict[tls.Epoch, QuicPacketSpace] = {}
         self._spin_bit = False
         self._spin_highest_pn = 0
         self._state = QuicConnectionState.FIRSTFLIGHT
@@ -369,13 +369,13 @@ class QuicConnection:
         self._close_pending = False
         self._datagrams_pending: Deque[bytes] = deque()
         self._handshake_done_pending = False
-        self._ping_pending: List[int] = []
+        self._ping_pending: list[int] = []
         self._probe_pending = False
         self._streams_blocked_pending = False
-        self._max_path_id_pending: Dict[int, int] = {} # max_path_id: tx_path_id
-        self._path_abandon: Dict[int, int] = {} # path_id: tx_path_id
-        self._set_paths_to_available: Dict[int, int] = {} # path_id: tx_path_id
-        self._set_paths_to_standby: Dict[int, int] = {} # path_id: tx_path_id
+        self._max_path_id_pending: dict[int, int] = {} # max_path_id: tx_path_id
+        self._path_abandon: dict[int, int] = {} # path_id: tx_path_id
+        self._set_paths_to_available: dict[int, int] = {} # path_id: tx_path_id
+        self._set_paths_to_standby: dict[int, int] = {} # path_id: tx_path_id
 
 
         # callbacks
@@ -1406,7 +1406,7 @@ class QuicConnection:
 
     def _find_network_path(
             self, destination_cid: bytes, remote_addr: NetworkAddress, local_addr: NetworkAddress,
-        ) -> Tuple[Optional[QuicNetworkPath], Optional[int]]:
+        ) -> tuple[Optional[QuicNetworkPath], Optional[int]]:
 
         # Check destination CID matches.
         for np in self._network_paths.values():

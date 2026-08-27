@@ -6,8 +6,6 @@ from dataclasses import dataclass
 from typing import (
     Any,
     Deque,
-    Dict,
-    List,
     Optional,
     Set,
 )
@@ -62,24 +60,24 @@ class QuicNetworkPath:
         # host_cid, peer_cid, and path_tuple can be None for paths in stock only.
         self.path_id: int = path_id
         self.host_cid: bytes = b''
-        self.host_cids: List[QuicConnectionId] = []
+        self.host_cids: list[QuicConnectionId] = []
         self.host_cid_seq: int = 0
         self.peer_cid: Optional[QuicConnectionId] = None
-        self.path_tuples: List[PathTuple] = []
+        self.path_tuples: list[PathTuple] = []
         self.active_path_tuple: Optional[PathTuple] = path_tuple
         self.pacing_at: Optional[float] = None
         self.packet_number: int = 0
-        self.peer_cid_available: List[QuicConnectionId] = []
+        self.peer_cid_available: list[QuicConnectionId] = []
         self.peer_cid_sequence_numbers: Set[int] = set()
         self.peer_retire_prior_to = 0
         self.loss = loss
         self.loss_at: Optional[float] = None
-        self.spaces: Dict[tls.Epoch, QuicPacketSpace] = {}
+        self.spaces: dict[tls.Epoch, QuicPacketSpace] = {}
 
         self._logger = logger
 
         # things to send
-        self.retire_connection_ids: List[int] = []
+        self.retire_connection_ids: list[int] = []
 
         if host_cid is not None:
             self.host_cid = host_cid.cid
@@ -89,7 +87,7 @@ class QuicNetworkPath:
             self.peer_cid = peer_cid
             self.peer_cid_sequence_numbers.add(0)
         if path_tuple is not None:
-            self.path_tuples: List[PathTuple] = [path_tuple]
+            self.path_tuples: list[PathTuple] = [path_tuple]
 
         
     def change_connection_id(self) -> None:
@@ -183,7 +181,7 @@ class QuicNetworkPath:
     
     def replenish_connection_ids(
             self, connection_id_length: int, remote_active_connection_id_limit: int
-        ) -> List[bytes]:
+        ) -> list[bytes]:
         """
         Generate new connection IDs. 
         Return generated IDs.
