@@ -195,6 +195,12 @@ class QuicLoggerTrace:
             "sequence_number": sequence_number,
         }
 
+    def encode_max_path_id_frame(self, max_path_id: int) -> dict:
+        return {
+            "frame_type": "max_path_id",
+            "maximum_path_id": max_path_id,
+        }
+
     def encode_stream_data_blocked_frame(self, limit: int, stream_id: int) -> dict:
         return {
             "frame_type": "stream_data_blocked",
