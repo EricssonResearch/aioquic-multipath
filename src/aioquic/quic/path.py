@@ -74,6 +74,13 @@ class QuicNetworkPath:
         self.loss_at: Optional[float] = None
         self.spaces: dict[tls.Epoch, QuicPacketSpace] = {}
 
+        # PATH_STATUS_AVAILABLE / PATH_STATUS_BACKUP (draft section 3.3/4.3)
+        self.local_status_seq: int = 0
+        self.local_status_available: Optional[bool] = None
+        self.local_status_sent: bool = True
+        self.remote_status_seq: Optional[int] = None
+        self.remote_status_available: Optional[bool] = None
+
         self._logger = logger
 
         # things to send

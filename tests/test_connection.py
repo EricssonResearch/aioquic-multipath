@@ -2055,6 +2055,110 @@ class QuicConnectionTest(TestCase):
             self.assertEqual(cm.exception.error_code, QuicErrorCode.PROTOCOL_VIOLATION)
             self.assertEqual(cm.exception.frame_type, QuicFrameType.PATH_RESPONSE)
 
+    def test_set_path_status(self):
+        with client_and_server() as (client, server):
+            network_path = client._network_paths[0]
+            self.assertIsNone(network_path.local_status_available)
+
+            self.assertTrue(client.set_path_status(0, available=True))
+            self.assertTrue(network_path.local_status_available)
+            self.assertFalse(network_path.local_status_sent)
+
+            # unknown path id
+            self.assertFalse(client.set_path_status(42, available=False))
+
+    def test_write_path_status_frame(self):
+        with client_and_server() as (client, server):
+            network_path = client._network_paths[0]
+            client.set_path_status(0, available=True)
+
+            builder = QuicPacketBuilder(
+                host_cid=network_path.host_cid,
+                is_client=True,
+                max_datagram_size=SMALLEST_MAX_DATAGRAM_SIZE,
+                peer_cid=network_path.peer_cid.cid,
+                version=client._version,
+            )
+            crypto = client._cryptos[tls.Epoch.ONE_RTT]
+            builder.start_packet(QuicPacketType.ONE_RTT, crypto)
+            client._write_path_status_frame(builder=builder, network_path=network_path)
+            self.assertFalse(builder.packet_is_empty)
+            self.assertTrue(network_path.local_status_sent)
+
+            # already sent: no-op until the preference changes again
+            builder2 = QuicPacketBuilder(
+                host_cid=network_path.host_cid,
+                is_client=True,
+                max_datagram_size=SMALLEST_MAX_DATAGRAM_SIZE,
+                peer_cid=network_path.peer_cid.cid,
+                version=client._version,
+            )
+            builder2.start_packet(QuicPacketType.ONE_RTT, crypto)
+            client._write_path_status_frame(builder=builder2, network_path=network_path)
+            self.assertTrue(builder2.packet_is_empty)
+
+    def test_on_path_status_delivery(self):
+        with client_and_server() as (client, server):
+            network_path = client._network_paths[0]
+            client.set_path_status(0, available=True)
+            network_path.local_status_sent = True
+            # sequence_number 0 was sent and is still the latest
+            client._on_path_status_delivery(QuicDeliveryState.LOST, network_path, 0)
+            self.assertFalse(network_path.local_status_sent)
+
+            # if a newer status has since been sent, an old delivery
+            # report must not trigger a resend
+            network_path.local_status_seq = 1
+            network_path.local_status_sent = True
+            client._on_path_status_delivery(QuicDeliveryState.LOST, network_path, 0)
+            self.assertTrue(network_path.local_status_sent)
+
+            # acked frames never trigger a resend
+            network_path.local_status_seq = 0
+            network_path.local_status_sent = True
+            client._on_path_status_delivery(QuicDeliveryState.ACKED, network_path, 0)
+            self.assertTrue(network_path.local_status_sent)
+
+    def test_handle_path_status_frame(self):
+        with client_and_server() as (client, server):
+            network_path = client._network_paths[0]
+            self.assertIsNone(network_path.remote_status_available)
+
+            client._handle_path_status_frame(
+                client_receive_context(client),
+                QuicFrameType.PATH_AVAILABLE,
+                Buffer(data=encode_uint_var(0) + encode_uint_var(0)),
+            )
+            self.assertTrue(network_path.remote_status_available)
+            self.assertEqual(network_path.remote_status_seq, 0)
+
+            # a higher sequence number updates the preference
+            client._handle_path_status_frame(
+                client_receive_context(client),
+                QuicFrameType.PATH_BACKUP,
+                Buffer(data=encode_uint_var(0) + encode_uint_var(1)),
+            )
+            self.assertFalse(network_path.remote_status_available)
+            self.assertEqual(network_path.remote_status_seq, 1)
+
+            # an equal-or-lower sequence number is ignored
+            client._handle_path_status_frame(
+                client_receive_context(client),
+                QuicFrameType.PATH_AVAILABLE,
+                Buffer(data=encode_uint_var(0) + encode_uint_var(1)),
+            )
+            self.assertFalse(network_path.remote_status_available)
+            self.assertEqual(network_path.remote_status_seq, 1)
+
+    def test_handle_path_status_frame_unknown_path(self):
+        with client_and_server() as (client, server):
+            # must be silently discarded, not raise
+            client._handle_path_status_frame(
+                client_receive_context(client),
+                QuicFrameType.PATH_AVAILABLE,
+                Buffer(data=encode_uint_var(42) + encode_uint_var(0)),
+            )
+
     def test_handle_padding_frame(self):
         client = create_standalone_client(self)
 

@@ -420,6 +420,8 @@ class QuicConnection:
             0x31: (self._handle_datagram_frame, EPOCHS("01")),
             0x3e: (self._handle_path_ack_frame, EPOCHS("1")),
             0x3f: (self._handle_path_ack_frame, EPOCHS("1")),
+            0x3e76: (self._handle_path_status_frame, EPOCHS("1")),
+            0x3e77: (self._handle_path_status_frame, EPOCHS("1")),
             0x3e78: (self._handle_path_new_connection_id_frame, EPOCHS("1")),
             0x3e79: (self._handle_path_retire_connection_id_frame, EPOCHS("1")),
 
@@ -1146,6 +1148,35 @@ class QuicConnection:
         """
         assert self._handshake_complete, "cannot change key before handshake completes"
         self._cryptos[tls.Epoch.ONE_RTT].update_key()
+
+    def set_path_status(self, path_id: int, available: bool) -> bool:
+        """
+        Signal a preference to the peer for how a path should be used,
+        by sending a PATH_STATUS_AVAILABLE or PATH_STATUS_BACKUP frame.
+
+        This is purely advisory (draft-ietf-quic-multipath section 3.3):
+        the peer is not required to honour it, and this method does not
+        itself change local scheduling behaviour.
+
+        Returns `True` if a status update was queued, `False` if
+        `path_id` is not a known path (checked against both active and
+        stock paths, since a status can be signalled before a path is
+        actually in use).
+
+        .. aioquic_transmit::
+
+        :param path_id: The path this status update applies to.
+        :param available: `True` to signal PATH_STATUS_AVAILABLE,
+            `False` to signal PATH_STATUS_BACKUP.
+        """
+        network_path = self._network_paths.get(path_id) or self._network_paths_stock.get(
+            path_id
+        )
+        if network_path is None:
+            return False
+        network_path.local_status_available = available
+        network_path.local_status_sent = False
+        return True
 
     def reset_stream(self, stream_id: int, error_code: int) -> None:
         """
@@ -2412,6 +2443,48 @@ class QuicConnection:
         )
         validated_path_tuple.is_validated = True
 
+    def _handle_path_status_frame(
+        self, context: QuicReceiveContext, frame_type: int, buf: Buffer
+    ) -> None:
+        """
+        Handle a PATH_STATUS_AVAILABLE or PATH_STATUS_BACKUP frame.
+        """
+        path_id = buf.pull_uint_var()
+        sequence_number = buf.pull_uint_var()
+
+        # log frame
+        if self._quic_logger is not None:
+            context.quic_logger_frames.append(
+                self._quic_logger.encode_path_status_frame(
+                    frame_type=frame_type,
+                    path_id=path_id,
+                    sequence_number=sequence_number,
+                )
+            )
+
+        network_path = self._network_paths.get(path_id) or self._network_paths_stock.get(
+            path_id
+        )
+        if network_path is None:
+            self._logger.info(
+                f"Discard PATH_STATUS frame for unknown path id {path_id}."
+            )
+            return
+
+        # The sequence number space is shared between PATH_STATUS_AVAILABLE
+        # and PATH_STATUS_BACKUP for a given path; a frame with a sequence
+        # number that does not strictly increase on the last one received
+        # for this path MUST be ignored (draft-ietf-quic-multipath section
+        # 4.3), since it may be reordered or outdated information.
+        if (
+            network_path.remote_status_seq is not None
+            and sequence_number <= network_path.remote_status_seq
+        ):
+            return
+
+        network_path.remote_status_seq = sequence_number
+        network_path.remote_status_available = frame_type == QuicFrameType.PATH_AVAILABLE
+
     def _handle_ping_frame(
         self, context: QuicReceiveContext, frame_type: int, buf: Buffer
     ) -> None:
@@ -2758,6 +2831,28 @@ class QuicConnection:
         """
         if delivery != QuicDeliveryState.ACKED:
             limit.sent = 0
+
+    def _on_path_status_delivery(
+        self,
+        delivery: QuicDeliveryState,
+        network_path: QuicNetworkPath,
+        sequence_number: int,
+    ) -> None:
+        """
+        Callback when a PATH_STATUS_AVAILABLE or PATH_STATUS_BACKUP frame
+        is acknowledged or lost.
+
+        Per draft-ietf-quic-multipath section 3.3/4.3, a lost status
+        frame is only resent if it still reflects the current
+        preference for this path (i.e. no newer status has since been
+        queued or sent for it).
+        """
+        if (
+            delivery != QuicDeliveryState.ACKED
+            and network_path.local_status_seq == sequence_number
+            and network_path.local_status_sent
+        ):
+            network_path.local_status_sent = False
 
     def _on_handshake_done_delivery(self, delivery: QuicDeliveryState) -> None:
         """
@@ -3498,6 +3593,12 @@ class QuicConnection:
                         builder=builder, challenge=challenge
                     )
 
+                # PATH_STATUS_AVAILABLE / PATH_STATUS_BACKUP
+                if self._multipath_negotiated:
+                    self._write_path_status_frame(
+                        builder=builder, network_path=network_path
+                    )
+
                 # NEW_CONNECTION_ID active path
                 if network_path.active_path_tuple.is_validated:
                     for np in self._network_paths.values():
@@ -3988,6 +4089,46 @@ class QuicConnection:
         if self._quic_logger is not None:
             builder.quic_logger_frames.append(
                 self._quic_logger.encode_path_response_frame(data=challenge)
+            )
+
+    def _write_path_status_frame(
+        self, builder: QuicPacketBuilder, network_path: QuicNetworkPath
+    ) -> None:
+        """
+        Send a pending PATH_STATUS_AVAILABLE or PATH_STATUS_BACKUP frame
+        for `network_path`, if a local preference has been set and not
+        yet sent.
+        """
+        if network_path.local_status_sent or network_path.local_status_available is None:
+            return
+
+        if network_path.local_status_available:
+            frame_type = QuicFrameType.PATH_AVAILABLE
+            capacity = PATH_AVAILABLE_FRAME_CAPACITY
+        else:
+            frame_type = QuicFrameType.PATH_BACKUP
+            capacity = PATH_BACKUP_FRAME_CAPACITY
+
+        sequence_number = network_path.local_status_seq
+        buf = builder.start_frame(
+            frame_type,
+            capacity=capacity,
+            handler=self._on_path_status_delivery,
+            handler_args=(network_path, sequence_number),
+        )
+        buf.push_uint_var(network_path.path_id)
+        buf.push_uint_var(sequence_number)
+        network_path.local_status_seq += 1
+        network_path.local_status_sent = True
+
+        # log frame
+        if self._quic_logger is not None:
+            builder.quic_logger_frames.append(
+                self._quic_logger.encode_path_status_frame(
+                    frame_type=frame_type,
+                    path_id=network_path.path_id,
+                    sequence_number=sequence_number,
+                )
             )
 
     def _write_ping_frame(
