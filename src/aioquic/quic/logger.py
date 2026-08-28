@@ -148,6 +148,19 @@ class QuicLoggerTrace:
 
     def encode_path_response_frame(self, data: bytes) -> dict:
         return {"data": hexdump(data), "frame_type": "path_response"}
+
+    def encode_path_status_frame(
+        self, frame_type: int, path_id: int, sequence_number: int
+    ) -> dict:
+        return {
+            "frame_type": (
+                "path_status_available"
+                if frame_type == QuicFrameType.PATH_AVAILABLE
+                else "path_status_backup"
+            ),
+            "path_id": path_id,
+            "sequence_number": sequence_number,
+        }
     
     def encode_path_new_connection_id_frame(
         self,
