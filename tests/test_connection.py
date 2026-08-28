@@ -2446,6 +2446,94 @@ class QuicConnectionTest(TestCase):
             )
             self.assertFalse(builder.packet_is_empty)
 
+    def test_raise_max_path_id(self):
+        with client_and_server() as (client, server):
+            self.assertIsNone(client._max_path_id)
+
+            self.assertTrue(client.raise_max_path_id(2))
+            self.assertEqual(client._max_path_id, 2)
+
+            # a higher value raises the limit again
+            self.assertTrue(client.raise_max_path_id(4))
+            self.assertEqual(client._max_path_id, 4)
+
+            # a non-increasing value is a no-op
+            self.assertFalse(client.raise_max_path_id(4))
+            self.assertFalse(client.raise_max_path_id(1))
+            self.assertEqual(client._max_path_id, 4)
+
+    def test_write_max_path_id_frame(self):
+        with client_and_server() as (client, server):
+            client._max_path_id = 2
+            client._max_path_id_sent = None
+
+            builder = QuicPacketBuilder(
+                host_cid=client._network_paths[0].host_cid,
+                is_client=True,
+                max_datagram_size=SMALLEST_MAX_DATAGRAM_SIZE,
+                peer_cid=client._network_paths[0].peer_cid.cid,
+                version=client._version,
+            )
+            crypto = client._cryptos[tls.Epoch.ONE_RTT]
+            builder.start_packet(QuicPacketType.ONE_RTT, crypto)
+            client._write_max_path_id_frame(builder=builder)
+            self.assertFalse(builder.packet_is_empty)
+            self.assertEqual(client._max_path_id_sent, 2)
+
+            # sending again with no change is a no-op
+            builder2 = QuicPacketBuilder(
+                host_cid=client._network_paths[0].host_cid,
+                is_client=True,
+                max_datagram_size=SMALLEST_MAX_DATAGRAM_SIZE,
+                peer_cid=client._network_paths[0].peer_cid.cid,
+                version=client._version,
+            )
+            builder2.start_packet(QuicPacketType.ONE_RTT, crypto)
+            client._write_max_path_id_frame(builder=builder2)
+            self.assertTrue(builder2.packet_is_empty)
+
+    def test_handle_max_path_id_frame(self):
+        with client_and_server() as (client, server):
+            self.assertIsNone(client._remote_max_path_id)
+
+            client._handle_max_path_id_frame(
+                client_receive_context(client),
+                QuicFrameType.MAX_PATH_ID,
+                Buffer(data=encode_uint_var(2)),
+            )
+            self.assertEqual(client._remote_max_path_id, 2)
+
+            # a lower/equal value is ignored, not an error
+            client._handle_max_path_id_frame(
+                client_receive_context(client),
+                QuicFrameType.MAX_PATH_ID,
+                Buffer(data=encode_uint_var(1)),
+            )
+            self.assertEqual(client._remote_max_path_id, 2)
+
+            # a higher value raises the limit
+            client._handle_max_path_id_frame(
+                client_receive_context(client),
+                QuicFrameType.MAX_PATH_ID,
+                Buffer(data=encode_uint_var(5)),
+            )
+            self.assertEqual(client._remote_max_path_id, 5)
+
+    def test_handle_max_path_id_frame_too_large(self):
+        with client_and_server() as (client, server):
+            with self.assertRaises(QuicConnectionError) as cm:
+                client._handle_max_path_id_frame(
+                    client_receive_context(client),
+                    QuicFrameType.MAX_PATH_ID,
+                    Buffer(data=encode_uint_var(2**32)),
+                )
+            self.assertEqual(cm.exception.error_code, QuicErrorCode.PROTOCOL_VIOLATION)
+            self.assertEqual(cm.exception.frame_type, QuicFrameType.MAX_PATH_ID)
+            self.assertEqual(
+                cm.exception.reason_phrase,
+                "Maximum Path Identifier must be <= 2^32-1",
+            )
+
     def test_handle_stop_sending_frame(self):
         with client_and_server() as (client, server):
             # client creates bidirectional stream 0
