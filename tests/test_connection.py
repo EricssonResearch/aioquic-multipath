@@ -2547,6 +2547,41 @@ class QuicConnectionTest(TestCase):
                 Buffer(data=encode_uint_var(1) + encode_uint_var(4)),
             )
 
+    def test_on_paths_blocked_delivery(self):
+        with client_and_server() as (client, server):
+            # a lost frame is re-armed if nothing more recent superseded it
+            client._paths_blocked_pending = None
+            client._on_paths_blocked_delivery(QuicDeliveryState.LOST, 3)
+            self.assertEqual(client._paths_blocked_pending, 3)
+
+            # if a newer report is already pending, do not overwrite it
+            client._paths_blocked_pending = 5
+            client._on_paths_blocked_delivery(QuicDeliveryState.LOST, 3)
+            self.assertEqual(client._paths_blocked_pending, 5)
+
+            # acked frames are never re-armed
+            client._paths_blocked_pending = None
+            client._on_paths_blocked_delivery(QuicDeliveryState.ACKED, 3)
+            self.assertIsNone(client._paths_blocked_pending)
+
+    def test_on_path_cids_blocked_delivery(self):
+        with client_and_server() as (client, server):
+            # a lost frame is re-armed if nothing more recent superseded it
+            client._path_cids_blocked_pending = {}
+            client._on_path_cids_blocked_delivery(QuicDeliveryState.LOST, 1, 4)
+            self.assertEqual(client._path_cids_blocked_pending, {1: 4})
+
+            # if a newer report for the same path is already pending,
+            # do not overwrite it
+            client._path_cids_blocked_pending = {1: 7}
+            client._on_path_cids_blocked_delivery(QuicDeliveryState.LOST, 1, 4)
+            self.assertEqual(client._path_cids_blocked_pending, {1: 7})
+
+            # acked frames are never re-armed
+            client._path_cids_blocked_pending = {}
+            client._on_path_cids_blocked_delivery(QuicDeliveryState.ACKED, 1, 4)
+            self.assertEqual(client._path_cids_blocked_pending, {})
+
     def test_handle_stop_sending_frame(self):
         with client_and_server() as (client, server):
             # client creates bidirectional stream 0

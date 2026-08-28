@@ -2846,25 +2846,38 @@ class QuicConnection:
         if delivery != QuicDeliveryState.ACKED:
             limit.sent = 0
 
-    def _on_paths_blocked_delivery(self, delivery: QuicDeliveryState) -> None:
+    def _on_paths_blocked_delivery(
+        self, delivery: QuicDeliveryState, max_path_id: int
+    ) -> None:
         """
         Callback when a PATHS_BLOCKED frame is acknowledged or lost.
 
-        PATHS_BLOCKED is purely informational (draft-ietf-quic-multipath
-        section 4.7): repeating it after loss would not change the
-        peer's behaviour if it already chose not to act, so it is not
-        retransmitted.
+        The draft only states that repeating this frame after it was
+        successfully received but not acted upon is pointless (draft-
+        ietf-quic-multipath section 4.7); it says nothing about a frame
+        that was lost in transit and never actually reached the peer.
+        Since the underlying condition (still at the peer's path ID
+        limit) typically persists, we re-arm sending on loss, but only
+        if nothing more recent has already superseded it.
         """
-        pass
+        if delivery != QuicDeliveryState.ACKED and self._paths_blocked_pending is None:
+            self._paths_blocked_pending = max_path_id
 
-    def _on_path_cids_blocked_delivery(self, delivery: QuicDeliveryState) -> None:
+    def _on_path_cids_blocked_delivery(
+        self, delivery: QuicDeliveryState, path_id: int, next_sequence_number: int
+    ) -> None:
         """
         Callback when a PATH_CIDS_BLOCKED frame is acknowledged or lost.
 
-        Same rationale as `_on_paths_blocked_delivery`: informational,
-        not retransmitted on loss.
+        Same rationale as `_on_paths_blocked_delivery`: re-arm on loss
+        unless a more recent report for the same path has already
+        superseded it.
         """
-        pass
+        if (
+            delivery != QuicDeliveryState.ACKED
+            and path_id not in self._path_cids_blocked_pending
+        ):
+            self._path_cids_blocked_pending[path_id] = next_sequence_number
 
     def _on_handshake_done_delivery(self, delivery: QuicDeliveryState) -> None:
         """
@@ -3991,6 +4004,7 @@ class QuicConnection:
                 QuicFrameType.PATHS_BLOCKED,
                 capacity=PATHS_BLOCKED_CAPACITY,
                 handler=self._on_paths_blocked_delivery,
+                handler_args=(max_path_id,),
             )
             buf.push_uint_var(max_path_id)
             self._paths_blocked_pending = None
@@ -4013,6 +4027,7 @@ class QuicConnection:
                 QuicFrameType.PATH_CIDS_BLOCKED,
                 capacity=PATH_CIDS_BLOCKED_CAPACITY,
                 handler=self._on_path_cids_blocked_delivery,
+                handler_args=(path_id, next_sequence_number),
             )
             buf.push_uint_var(path_id)
             buf.push_uint_var(next_sequence_number)
