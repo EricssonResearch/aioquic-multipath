@@ -2451,6 +2451,7 @@ class QuicConnectionTest(TestCase):
     ):
         with client_and_server() as (client, server):
             client._multipath_negotiated = True
+            client._max_path_id = 1
             client._remote_max_path_id = 1
 
             # no stock path exists at all, but path ID 1 is valid per the
@@ -2465,6 +2466,7 @@ class QuicConnectionTest(TestCase):
     def test_add_unvalidated_path_reports_path_cids_blocked_for_existing_path(self):
         with client_and_server() as (client, server):
             client._multipath_negotiated = True
+            client._max_path_id = 1
             client._remote_max_path_id = 1
 
             # a stock path exists for path ID 1 (we know the path ID and
@@ -2485,6 +2487,7 @@ class QuicConnectionTest(TestCase):
     def test_add_unvalidated_path_reports_paths_blocked(self):
         with client_and_server() as (client, server):
             client._multipath_negotiated = True
+            client._max_path_id = 1
             client._remote_max_path_id = 0
 
             # path ID 0 is already active; the peer allows nothing beyond
@@ -2494,6 +2497,21 @@ class QuicConnectionTest(TestCase):
             )
             self.assertIsNone(client._path_cids_blocked_pending.get(0))
             self.assertEqual(client._paths_blocked_pending, 0)
+
+    def test_add_unvalidated_path_never_reports_path_id_beyond_local_max(self):
+        with client_and_server() as (client, server):
+            client._multipath_negotiated = True
+            # our own limit (0) is lower than what the peer allows (5): we
+            # must never report a candidate path ID beyond our own limit,
+            # even though it would otherwise be "valid" per the peer
+            client._max_path_id = 0
+            client._remote_max_path_id = 5
+
+            self.assertFalse(
+                client.add_unvalidated_path(SERVER_ADDR, CLIENT_ADDR)
+            )
+            self.assertEqual(client._path_cids_blocked_pending, {})
+            self.assertIsNone(client._paths_blocked_pending)
 
     def test_write_paths_blocked_frame(self):
         with client_and_server() as (client, server):

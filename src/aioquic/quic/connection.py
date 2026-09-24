@@ -488,12 +488,14 @@ class QuicConnection:
         # 3.2.1), so if there is a path ID below that limit we have not
         # yet assigned at all, we are also blocked for lack of connection
         # IDs on that path ID, not blocked by the max path ID limit.
+        # Bounded by our own max_path_id too, since we would never accept
+        # a path ID beyond that regardless of what the peer allows. The
+        # preceding loop already visited every _network_paths_stock key,
+        # so only _network_paths needs checking here.
         if cids_blocked_path_id is None and self._remote_max_path_id is not None:
-            for candidate_path_id in range(self._remote_max_path_id + 1):
-                if (
-                    candidate_path_id not in self._network_paths
-                    and candidate_path_id not in self._network_paths_stock
-                ):
+            usable_max_path_id = min(self._max_path_id, self._remote_max_path_id)
+            for candidate_path_id in range(usable_max_path_id + 1):
+                if candidate_path_id not in self._network_paths:
                     cids_blocked_path_id = candidate_path_id
                     break
 
