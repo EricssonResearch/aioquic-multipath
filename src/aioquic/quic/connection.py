@@ -1166,6 +1166,14 @@ class QuicConnection:
         if self._max_path_id is not None and max_path_id <= self._max_path_id:
             return False
         self._max_path_id = max_path_id
+
+        # Raising our own limit can unblock stock paths for path IDs the
+        # peer already allows (min(self._max_path_id, self._remote_max_path_id)
+        # may increase even though the peer's own limit did not change) -
+        # set them up eagerly, same as when a MAX_PATH_ID frame raises the
+        # peer's limit instead.
+        if self._multipath_negotiated:
+            self._setup_paths_in_stock()
         return True
 
     def reset_stream(self, stream_id: int, error_code: int) -> None:
@@ -2630,6 +2638,15 @@ class QuicConnection:
         # ignored rather than treated as an error.
         if self._remote_max_path_id is None or max_path_id > self._remote_max_path_id:
             self._remote_max_path_id = max_path_id
+
+            # Eagerly create stock paths for the newly permitted range,
+            # consistent with the handshake-time behaviour in
+            # _setup_paths_in_stock(): initial_max_path_id and MAX_PATH_ID
+            # are both peer-controlled values already bounded by our own
+            # max_path_id, so there is no reason to treat a mid-connection
+            # increase any more cautiously than the handshake-time one.
+            if self._multipath_negotiated:
+                self._setup_paths_in_stock()
 
     def _handle_stop_sending_frame(
         self, context: QuicReceiveContext, frame_type: int, buf: Buffer
