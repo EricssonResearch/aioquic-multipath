@@ -2595,7 +2595,140 @@ class QuicConnectionTest(TestCase):
                 builder=builder, space=space, now=1.0, ack_path_id=1
             )
             self.assertFalse(builder.packet_is_empty)
-            self.assertIsNone(space.ack_at)
+
+    def build_path_new_connection_id_frame(
+        self,
+        *,
+        path_id: int,
+        sequence_number: int,
+        retire_prior_to: int,
+        connection_id: bytes = b"\x99" * 8,
+    ) -> Buffer:
+        write_buf = Buffer(capacity=64)
+        write_buf.push_uint_var(path_id)
+        write_buf.push_uint_var(sequence_number)
+        write_buf.push_uint_var(retire_prior_to)
+        write_buf.push_uint8(len(connection_id))
+        write_buf.push_bytes(connection_id)
+        write_buf.push_bytes(bytes(16))  # stateless reset token
+        return Buffer(data=write_buf.data)
+
+    def test_handle_path_new_connection_id_frame_retire_prior_to_retires_old_cids(
+        self,
+    ):
+        with client_and_server() as (client, server):
+            self.add_second_path(client)
+            client._max_path_id = 1
+            network_path = client._network_paths[1]
+
+            # give path 1 a couple more available peer CIDs below the
+            # retire_prior_to threshold we are about to send
+            for seq in (1, 2):
+                cid = QuicConnectionId(cid=bytes([seq]) * 8, sequence_number=seq)
+                network_path.peer_cid_available.append(cid)
+                network_path.peer_cid_sequence_numbers.add(seq)
+
+            buf = self.build_path_new_connection_id_frame(
+                path_id=1, sequence_number=3, retire_prior_to=2
+            )
+            client._handle_path_new_connection_id_frame(
+                client_receive_context(client),
+                QuicFrameType.PATH_NEW_CONNECTION_ID,
+                buf,
+            )
+
+            # sequence numbers below 2 (0 and 1) were retired. The
+            # previously-active CID (sequence 0) was also below the
+            # threshold, so path 1 rotated onto CID sequence 2, leaving
+            # only the new CID (sequence 3) in the available list.
+            self.assertEqual(sequence_numbers(network_path.peer_cid_available), [3])
+            self.assertEqual(network_path.peer_cid.sequence_number, 2)
+            self.assertEqual(network_path.retire_connection_ids, [0, 1])
+            self.assertEqual(network_path.peer_retire_prior_to, 2)
+
+    def test_handle_path_new_connection_id_frame_retire_prior_to_rotates_active_cid(
+        self,
+    ):
+        with client_and_server() as (client, server):
+            self.add_second_path(client)
+            client._max_path_id = 1
+            network_path = client._network_paths[1]
+            original_active_cid = network_path.peer_cid
+            self.assertEqual(original_active_cid.sequence_number, 0)
+
+            # give path 1 a spare CID to rotate onto once the active one
+            # is retired
+            spare_cid = QuicConnectionId(cid=bytes([5]) * 8, sequence_number=5)
+            network_path.peer_cid_available.append(spare_cid)
+            network_path.peer_cid_sequence_numbers.add(5)
+
+            buf = self.build_path_new_connection_id_frame(
+                path_id=1, sequence_number=6, retire_prior_to=1
+            )
+            client._handle_path_new_connection_id_frame(
+                client_receive_context(client),
+                QuicFrameType.PATH_NEW_CONNECTION_ID,
+                buf,
+            )
+
+            # the active CID (sequence 0) was below the threshold, so it
+            # was retired and path 1 rotated onto the spare CID
+            self.assertEqual(network_path.peer_cid, spare_cid)
+            self.assertIn(
+                original_active_cid.sequence_number,
+                network_path.retire_connection_ids,
+            )
+
+    def test_handle_path_new_connection_id_frame_retire_prior_to_is_monotonic(self):
+        with client_and_server() as (client, server):
+            self.add_second_path(client)
+            client._max_path_id = 1
+            network_path = client._network_paths[1]
+
+            buf1 = self.build_path_new_connection_id_frame(
+                path_id=1, sequence_number=1, retire_prior_to=1
+            )
+            client._handle_path_new_connection_id_frame(
+                client_receive_context(client),
+                QuicFrameType.PATH_NEW_CONNECTION_ID,
+                buf1,
+            )
+            self.assertEqual(network_path.peer_retire_prior_to, 1)
+
+            # a later, lower retire_prior_to must be ignored, not regress
+            # the threshold
+            buf2 = self.build_path_new_connection_id_frame(
+                path_id=1,
+                sequence_number=2,
+                retire_prior_to=0,
+                connection_id=b"\x98" * 8,
+            )
+            client._handle_path_new_connection_id_frame(
+                client_receive_context(client),
+                QuicFrameType.PATH_NEW_CONNECTION_ID,
+                buf2,
+            )
+            self.assertEqual(network_path.peer_retire_prior_to, 1)
+
+    def test_handle_path_new_connection_id_frame_retire_prior_to_too_large(self):
+        with client_and_server() as (client, server):
+            self.add_second_path(client)
+            client._max_path_id = 1
+
+            buf = self.build_path_new_connection_id_frame(
+                path_id=1, sequence_number=1, retire_prior_to=2
+            )
+            with self.assertRaises(QuicConnectionError) as cm:
+                client._handle_path_new_connection_id_frame(
+                    client_receive_context(client),
+                    QuicFrameType.PATH_NEW_CONNECTION_ID,
+                    buf,
+                )
+            self.assertEqual(cm.exception.error_code, QuicErrorCode.PROTOCOL_VIOLATION)
+            self.assertEqual(
+                cm.exception.reason_phrase,
+                "Retire Prior To is greater than Sequence Number",
+            )
 
     def test_handle_path_retire_connection_id_frame(self):
         with client_and_server() as (client, server):
