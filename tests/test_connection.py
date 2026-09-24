@@ -2730,6 +2730,25 @@ class QuicConnectionTest(TestCase):
                 "Retire Prior To is greater than Sequence Number",
             )
 
+    def test_handle_path_new_connection_id_frame_without_multipath_negotiated(self):
+        # A PATH_NEW_CONNECTION_ID frame received on a connection that has
+        # not negotiated multipath must be rejected as a protocol
+        # violation, not processed.
+        with client_and_server() as (client, server):
+            self.assertIsNone(client._max_path_id)
+            self.assertFalse(client._multipath_negotiated)
+
+            buf = self.build_path_new_connection_id_frame(
+                path_id=1, sequence_number=1, retire_prior_to=0
+            )
+            with self.assertRaises(QuicConnectionError) as cm:
+                client._handle_path_new_connection_id_frame(
+                    client_receive_context(client),
+                    QuicFrameType.PATH_NEW_CONNECTION_ID,
+                    buf,
+                )
+            self.assertEqual(cm.exception.error_code, QuicErrorCode.PROTOCOL_VIOLATION)
+
     def test_handle_path_retire_connection_id_frame(self):
         with client_and_server() as (client, server):
             self.add_second_path(client)
