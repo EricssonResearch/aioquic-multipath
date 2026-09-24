@@ -2324,6 +2324,172 @@ class QuicConnectionTest(TestCase):
         )
         connection._replenish_connection_ids(path_id)
 
+    def add_stock_path_with_peer_cid(
+        self, connection: QuicConnection, path_id: int
+    ) -> None:
+        """
+        Create a stock (not yet activated) path with both our own host
+        CIDs and at least one usable peer-issued CID, as if a
+        PATH_NEW_CONNECTION_ID frame had already been received for it -
+        the state add_unvalidated_path()/_find_network_path() need to
+        successfully activate the path.
+        """
+        connection._create_network_path(
+            path_id=path_id,
+            host_cid=None,
+            peer_cid=None,
+            path_tuple=None,
+            stock=True,
+        )
+        connection._replenish_connection_ids(path_id)
+        peer_cid = QuicConnectionId(
+            cid=bytes([path_id + 0x20]) * 8, sequence_number=0
+        )
+        stock_path = connection._network_paths_stock[path_id]
+        stock_path.peer_cid_available.append(peer_cid)
+        stock_path.peer_cid_sequence_numbers.add(peer_cid.sequence_number)
+
+    def test_add_unvalidated_path(self):
+        with client_and_server() as (client, server):
+            client._multipath_negotiated = True
+            self.add_stock_path_with_peer_cid(client, path_id=1)
+            self.assertEqual(list(client._network_paths_stock.keys()), [1])
+            self.assertEqual(list(client._network_paths.keys()), [0])
+
+            self.assertTrue(
+                client.add_unvalidated_path(SERVER_ADDR, CLIENT_ADDR)
+            )
+
+            # the stock path was promoted to active and is no longer in
+            # stock; it now has a 4-tuple and consumed the available CIDs
+            self.assertEqual(sorted(client._network_paths.keys()), [0, 1])
+            self.assertEqual(list(client._network_paths_stock.keys()), [])
+            new_path = client._network_paths[1]
+            self.assertIsNotNone(new_path.active_path_tuple)
+            self.assertEqual(new_path.active_path_tuple.local_addr, CLIENT_ADDR)
+            self.assertEqual(new_path.active_path_tuple.remote_addr, SERVER_ADDR)
+            self.assertEqual(new_path.host_cid, new_path.host_cids[0].cid)
+            self.assertEqual(new_path.peer_cid_available, [])
+
+    def test_add_unvalidated_path_no_multipath_negotiated(self):
+        with client_and_server() as (client, server):
+            # multipath was never negotiated on this connection
+            self.assertFalse(
+                client.add_unvalidated_path(SERVER_ADDR, CLIENT_ADDR)
+            )
+
+    def test_add_unvalidated_path_no_usable_stock_path(self):
+        with client_and_server() as (client, server):
+            client._multipath_negotiated = True
+            # a stock path exists, but with no peer-issued CID yet
+            client._create_network_path(
+                path_id=1, host_cid=None, peer_cid=None, path_tuple=None, stock=True
+            )
+            client._replenish_connection_ids(1)
+
+            self.assertFalse(
+                client.add_unvalidated_path(SERVER_ADDR, CLIENT_ADDR)
+            )
+            self.assertEqual(list(client._network_paths_stock.keys()), [1])
+
+    def test_find_network_path_matches_active_path(self):
+        with client_and_server() as (client, server):
+            active_path = client._network_paths[0]
+            destination_cid = active_path.host_cids[0].cid
+
+            network_path, sequence_number = client._find_network_path(
+                destination_cid, SERVER_ADDR, CLIENT_ADDR
+            )
+            self.assertIs(network_path, active_path)
+            self.assertEqual(sequence_number, 0)
+
+    def test_find_network_path_promotes_stock_path(self):
+        with client_and_server() as (client, server):
+            self.add_stock_path_with_peer_cid(client, path_id=1)
+            stock_path = client._network_paths_stock[1]
+            destination_cid = stock_path.host_cids[0].cid
+
+            network_path, sequence_number = client._find_network_path(
+                destination_cid, SERVER_ADDR, CLIENT_ADDR
+            )
+
+            # the stock path is now active, with a 4-tuple assigned and
+            # its available peer CID consumed
+            self.assertIs(network_path, client._network_paths[1])
+            self.assertNotIn(1, client._network_paths_stock)
+            self.assertEqual(sequence_number, 0)
+            self.assertIsNotNone(network_path.active_path_tuple)
+            self.assertEqual(network_path.active_path_tuple.remote_addr, SERVER_ADDR)
+            self.assertEqual(network_path.active_path_tuple.local_addr, CLIENT_ADDR)
+            self.assertEqual(network_path.peer_cid_available, [])
+
+    def test_find_network_path_server_bootstraps_path_zero(self):
+        server = create_standalone_server(self)
+        self.assertEqual(list(server._network_paths.keys()), [])
+
+        destination_cid = os.urandom(8)
+        network_path, sequence_number = server._find_network_path(
+            destination_cid, CLIENT_ADDR, SERVER_ADDR
+        )
+
+        self.assertEqual(network_path.path_id, 0)
+        self.assertIs(server._network_paths[0], network_path)
+        self.assertEqual(sequence_number, 0)
+        self.assertTrue(network_path.active_path_tuple.is_validated)
+        self.assertEqual(network_path.active_path_tuple.remote_addr, CLIENT_ADDR)
+        self.assertEqual(network_path.active_path_tuple.local_addr, SERVER_ADDR)
+
+    def test_find_network_path_no_match(self):
+        with client_and_server() as (client, server):
+            network_path, sequence_number = client._find_network_path(
+                os.urandom(8), SERVER_ADDR, CLIENT_ADDR
+            )
+            self.assertIsNone(network_path)
+            self.assertIsNone(sequence_number)
+
+    def test_change_connection_id_on_second_path(self):
+        with client_and_server() as (client, server):
+            self.add_second_path(client)
+            network_path = client._network_paths[1]
+            original_peer_cid = network_path.peer_cid
+
+            next_peer_cid = QuicConnectionId(
+                cid=bytes([0x30]) * 8, sequence_number=1
+            )
+            network_path.peer_cid_available.append(next_peer_cid)
+            network_path.peer_cid_sequence_numbers.add(1)
+
+            network_path.change_connection_id()
+
+            # path 1 rotated to the next available peer CID and queued
+            # the old one for retirement
+            self.assertEqual(network_path.peer_cid, next_peer_cid)
+            self.assertEqual(network_path.peer_cid_available, [])
+            self.assertEqual(
+                network_path.retire_connection_ids,
+                [original_peer_cid.sequence_number],
+            )
+
+            # path 0 must be completely unaffected by rotating path 1
+            self.assertEqual(
+                sequence_numbers(client._network_paths[0].peer_cid_available),
+                [1, 2, 3, 4, 5, 6, 7],
+            )
+            self.assertEqual(client._network_paths[0].retire_connection_ids, [])
+
+    def test_change_connection_id_no_available_cid(self):
+        with client_and_server() as (client, server):
+            self.add_second_path(client)
+            network_path = client._network_paths[1]
+            original_peer_cid = network_path.peer_cid
+
+            # no peer CID has been issued for path 1 yet: change_connection_id
+            # is a no-op rather than an error
+            network_path.change_connection_id()
+
+            self.assertEqual(network_path.peer_cid, original_peer_cid)
+            self.assertEqual(network_path.retire_connection_ids, [])
+
     def test_handle_path_retire_connection_id_frame(self):
         with client_and_server() as (client, server):
             self.add_second_path(client)
