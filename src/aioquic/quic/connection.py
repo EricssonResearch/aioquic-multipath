@@ -483,21 +483,15 @@ class QuicConnection:
                 # it yet - candidate to report via PATH_CIDS_BLOCKED
                 cids_blocked_path_id = path_id
 
-        # No usable stock path: every path ID up to the peer's advertised
-        # limit is implicitly valid (draft-ietf-quic-multipath section
-        # 3.2.1), so if there is a path ID below that limit we have not
-        # yet assigned at all, we are also blocked for lack of connection
-        # IDs on that path ID, not blocked by the max path ID limit.
-        # Bounded by our own max_path_id too, since we would never accept
-        # a path ID beyond that regardless of what the peer allows. The
-        # preceding loop already visited every _network_paths_stock key,
-        # so only _network_paths needs checking here.
-        if cids_blocked_path_id is None and self._remote_max_path_id is not None:
-            usable_max_path_id = min(self._max_path_id, self._remote_max_path_id)
-            for candidate_path_id in range(usable_max_path_id + 1):
-                if candidate_path_id not in self._network_paths:
-                    cids_blocked_path_id = candidate_path_id
-                    break
+        # No usable stock path found above. Every path ID up to
+        # min(self._max_path_id, self._remote_max_path_id) is eagerly
+        # given a _network_paths/_network_paths_stock entry as soon as
+        # that limit is known (see _setup_paths_in_stock, called both at
+        # handshake confirmation and whenever max_path_id rises on either
+        # side), so the loop above already covers every path ID we could
+        # possibly want to activate: cids_blocked_path_id already points
+        # at the first one lacking a peer CID if any do, or nothing is
+        # blocked at all if every one of them is fully usable.
 
         if cids_blocked_path_id is not None:
             stock_path = self._network_paths_stock.get(cids_blocked_path_id)

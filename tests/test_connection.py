@@ -2446,23 +2446,6 @@ class QuicConnectionTest(TestCase):
             )
             self.assertFalse(builder.packet_is_empty)
 
-    def test_add_unvalidated_path_reports_path_cids_blocked_for_unassigned_path_id(
-        self,
-    ):
-        with client_and_server() as (client, server):
-            client._multipath_negotiated = True
-            client._max_path_id = 1
-            client._remote_max_path_id = 1
-
-            # no stock path exists at all, but path ID 1 is valid per the
-            # peer's advertised limit and simply has not been assigned any
-            # connection IDs yet
-            self.assertFalse(
-                client.add_unvalidated_path(SERVER_ADDR, CLIENT_ADDR)
-            )
-            self.assertEqual(client._path_cids_blocked_pending, {1: 0})
-            self.assertIsNone(client._paths_blocked_pending)
-
     def test_add_unvalidated_path_reports_path_cids_blocked_for_existing_path(self):
         with client_and_server() as (client, server):
             client._multipath_negotiated = True
