@@ -35,8 +35,12 @@ from aioquic.quic.packet import (
     encode_quic_version_negotiation,
     push_quic_transport_parameters,
 )
-from aioquic.quic.packet_builder import QuicDeliveryState, QuicPacketBuilder
-from aioquic.quic.recovery import QuicPacketPacer
+from aioquic.quic.packet_builder import (
+    QuicDeliveryState,
+    QuicPacketBuilder,
+    QuicSentPacket,
+)
+from aioquic.quic.recovery import QuicPacketPacer, QuicPacketSpace
 
 from .utils import (
     SERVER_CACERTFILE,
@@ -2323,6 +2327,9 @@ class QuicConnectionTest(TestCase):
             ),
         )
         connection._replenish_connection_ids(path_id)
+        network_path = connection._network_paths[path_id]
+        network_path.spaces = {tls.Epoch.ONE_RTT: QuicPacketSpace()}
+        network_path.loss.spaces = list(network_path.spaces.values())
 
     def add_stock_path_with_peer_cid(
         self, connection: QuicConnection, path_id: int
@@ -2489,6 +2496,106 @@ class QuicConnectionTest(TestCase):
 
             self.assertEqual(network_path.peer_cid, original_peer_cid)
             self.assertEqual(network_path.retire_connection_ids, [])
+
+    def test_handle_path_ack_frame(self):
+        with client_and_server() as (client, server):
+            self.add_second_path(client)
+            network_path = client._network_paths[1]
+            space = network_path.spaces[tls.Epoch.ONE_RTT]
+
+            # send something on path 1 so there is a packet to acknowledge
+            packet = QuicSentPacket(
+                epoch=tls.Epoch.ONE_RTT,
+                in_flight=True,
+                is_ack_eliciting=True,
+                is_crypto_packet=False,
+                packet_number=0,
+                packet_type=QuicPacketType.ONE_RTT,
+                sent_time=0.0,
+            )
+            network_path.loss.on_packet_sent(packet=packet, space=space)
+
+            buf = Buffer(capacity=32)
+            buf.push_uint_var(1)  # path id
+            buf.push_uint_var(0)  # largest acknowledged
+            buf.push_uint_var(0)  # ack delay
+            buf.push_uint_var(0)  # ack range count
+            buf.push_uint_var(0)  # first ack range
+            buf.seek(0)
+
+            client._handle_path_ack_frame(
+                client_receive_context(client),
+                QuicFrameType.PATH_ACK,
+                buf,
+            )
+
+            self.assertEqual(space.sent_packets, {})
+
+    def test_handle_path_ack_ecn_frame(self):
+        with client_and_server() as (client, server):
+            self.add_second_path(client)
+
+            write_buf = Buffer(capacity=32)
+            write_buf.push_uint_var(1)  # path id
+            write_buf.push_uint_var(0)  # largest acknowledged
+            write_buf.push_uint_var(0)  # ack delay
+            write_buf.push_uint_var(0)  # ack range count
+            write_buf.push_uint_var(0)  # first ack range
+            write_buf.push_uint_var(0)  # ECT0 count
+            write_buf.push_uint_var(0)  # ECT1 count
+            write_buf.push_uint_var(0)  # ECN-CE count
+            buf = Buffer(data=write_buf.data)
+
+            # must not raise, and must consume the whole buffer including
+            # the ECN counts
+            client._handle_path_ack_frame(
+                client_receive_context(client),
+                QuicFrameType.PATH_ACK_ECN,
+                buf,
+            )
+            self.assertTrue(buf.eof())
+
+    def test_handle_path_ack_frame_unknown_path(self):
+        with client_and_server() as (client, server):
+            buf = Buffer(capacity=32)
+            buf.push_uint_var(42)  # unknown path id
+            buf.push_uint_var(0)
+            buf.push_uint_var(0)
+            buf.push_uint_var(0)
+            buf.push_uint_var(0)
+            buf.seek(0)
+
+            # must be silently discarded, not raise
+            client._handle_path_ack_frame(
+                client_receive_context(client),
+                QuicFrameType.PATH_ACK,
+                buf,
+            )
+
+    def test_write_path_ack_frame(self):
+        with client_and_server() as (client, server):
+            self.add_second_path(client)
+            network_path = client._network_paths[1]
+            space = network_path.spaces[tls.Epoch.ONE_RTT]
+            space.ack_queue.add(0, 1)
+            space.ack_at = 1.0
+            space.largest_received_packet = 0
+            space.largest_received_time = 0.0
+
+            builder = QuicPacketBuilder(
+                host_cid=network_path.host_cid,
+                is_client=True,
+                max_datagram_size=SMALLEST_MAX_DATAGRAM_SIZE,
+                peer_cid=network_path.peer_cid.cid,
+                version=client._version,
+            )
+            crypto = client._cryptos[tls.Epoch.ONE_RTT]
+            builder.start_packet(QuicPacketType.ONE_RTT, crypto)
+            client._write_path_ack_frame(
+                builder=builder, space=space, now=1.0, ack_path_id=1
+            )
+            self.assertFalse(builder.packet_is_empty)
+            self.assertIsNone(space.ack_at)
 
     def test_handle_path_retire_connection_id_frame(self):
         with client_and_server() as (client, server):
