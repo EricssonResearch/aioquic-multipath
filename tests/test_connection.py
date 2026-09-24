@@ -2462,6 +2462,35 @@ class QuicConnectionTest(TestCase):
             self.assertFalse(client.raise_max_path_id(1))
             self.assertEqual(client._max_path_id, 4)
 
+    def test_raise_max_path_id_eagerly_creates_stock_paths(self):
+        with client_and_server() as (client, server):
+            client._multipath_negotiated = True
+            client._max_path_id = 0
+            client._remote_max_path_id = 2
+
+            # path 0 already exists (the initial path); nothing else does,
+            # since our own limit (0) has been the binding constraint
+            self.assertEqual(list(client._network_paths.keys()), [0])
+            self.assertEqual(list(client._network_paths_stock.keys()), [])
+
+            # raising our own limit unblocks path IDs the peer already
+            # allowed; these should be set up eagerly, same as when the
+            # peer's limit rises instead
+            self.assertTrue(client.raise_max_path_id(2))
+            self.assertEqual(sorted(client._network_paths_stock.keys()), [1, 2])
+            for path_id in (1, 2):
+                self.assertTrue(client._network_paths_stock[path_id].host_cids)
+
+    def test_raise_max_path_id_ignored_value_does_not_create_stock_paths(self):
+        with client_and_server() as (client, server):
+            client._multipath_negotiated = True
+            client._max_path_id = 2
+            client._remote_max_path_id = 2
+
+            # a non-increasing value must not trigger setup
+            self.assertFalse(client.raise_max_path_id(1))
+            self.assertEqual(list(client._network_paths_stock.keys()), [])
+
     def test_write_max_path_id_frame(self):
         with client_and_server() as (client, server):
             client._max_path_id = 2
@@ -2518,6 +2547,45 @@ class QuicConnectionTest(TestCase):
                 Buffer(data=encode_uint_var(5)),
             )
             self.assertEqual(client._remote_max_path_id, 5)
+
+    def test_handle_max_path_id_frame_eagerly_creates_stock_paths(self):
+        with client_and_server() as (client, server):
+            client._multipath_negotiated = True
+            client._max_path_id = 2
+            client._remote_max_path_id = 0
+
+            # path 0 already exists (the initial path); nothing else does
+            self.assertEqual(list(client._network_paths.keys()), [0])
+            self.assertEqual(list(client._network_paths_stock.keys()), [])
+
+            # raising the peer's limit should eagerly create stock paths
+            # for the newly permitted range, capped by our own max_path_id,
+            # the same way the handshake-time setup does
+            client._handle_max_path_id_frame(
+                client_receive_context(client),
+                QuicFrameType.MAX_PATH_ID,
+                Buffer(data=encode_uint_var(2)),
+            )
+            self.assertEqual(client._remote_max_path_id, 2)
+            self.assertEqual(sorted(client._network_paths_stock.keys()), [1, 2])
+            # each new stock path already has our own connection IDs ready
+            for path_id in (1, 2):
+                self.assertTrue(client._network_paths_stock[path_id].host_cids)
+
+    def test_handle_max_path_id_frame_ignored_value_does_not_create_stock_paths(self):
+        with client_and_server() as (client, server):
+            client._multipath_negotiated = True
+            client._max_path_id = 2
+            client._remote_max_path_id = 2
+
+            client._handle_max_path_id_frame(
+                client_receive_context(client),
+                QuicFrameType.MAX_PATH_ID,
+                Buffer(data=encode_uint_var(1)),
+            )
+            self.assertEqual(client._remote_max_path_id, 2)
+            # the ignored (non-increasing) value must not trigger setup
+            self.assertEqual(list(client._network_paths_stock.keys()), [])
 
     def test_handle_max_path_id_frame_too_large(self):
         with client_and_server() as (client, server):
