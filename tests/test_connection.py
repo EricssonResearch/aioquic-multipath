@@ -40,6 +40,7 @@ from aioquic.quic.packet_builder import (
     QuicPacketBuilder,
     QuicSentPacket,
 )
+from aioquic.quic.rangeset import RangeSet
 from aioquic.quic.recovery import QuicPacketPacer, QuicPacketSpace
 
 from .utils import (
@@ -3916,6 +3917,64 @@ class QuicConnectionTest(TestCase):
                 }
             ],
         )
+
+    def test_network_paths_have_independent_recovery_objects(self):
+        with client_and_server() as (client, server):
+            self.add_second_path(client)
+            self.assertIsNot(
+                client._network_paths[0].loss, client._network_paths[1].loss
+            )
+
+    def test_path_loss_detection_timeout_triggers_probe(self):
+        # A PTO firing on any path's QuicPacketRecovery (with nothing to
+        # declare lost) must result in a probe being requested at the
+        # connection level.
+        with client_and_server() as (client, server):
+            self.add_second_path(client)
+            network_path = client._network_paths[1]
+
+            self.assertFalse(client._probe_pending)
+            network_path.loss.on_loss_detection_timeout(now=1.0)
+            self.assertTrue(client._probe_pending)
+
+    def test_path_congestion_control_is_isolated_per_path(self):
+        # Congestion window growth on one path must not affect another
+        # path's congestion controller.
+        with client_and_server() as (client, server):
+            self.add_second_path(client)
+            path0 = client._network_paths[0]
+            path1 = client._network_paths[1]
+            space1 = path1.spaces[tls.Epoch.ONE_RTT]
+
+            # path 0 and path 1 are not expected to have equal windows
+            # here, since path 0 has already carried handshake traffic;
+            # each baseline is only compared against its own path below
+            initial_window_path0 = path0.loss._cc.congestion_window
+            initial_window_path1 = path1.loss._cc.congestion_window
+
+            # send and acknowledge a full window's worth of data on path 1
+            # only, to grow its congestion window
+            packet = QuicSentPacket(
+                epoch=tls.Epoch.ONE_RTT,
+                in_flight=True,
+                is_ack_eliciting=True,
+                is_crypto_packet=False,
+                packet_number=0,
+                packet_type=QuicPacketType.ONE_RTT,
+                sent_bytes=initial_window_path1,
+                sent_time=1.0,
+            )
+            path1.loss.on_packet_sent(packet=packet, space=space1)
+            path1.loss.on_ack_received(
+                ack_rangeset=RangeSet([range(0, 1)]),
+                ack_delay=0.0,
+                now=2.0,
+                space=space1,
+            )
+
+            # path 1's window grew, path 0's did not move at all
+            self.assertGreater(path1.loss._cc.congestion_window, initial_window_path1)
+            self.assertEqual(path0.loss._cc.congestion_window, initial_window_path0)
 
 
 class QuicNetworkPathTest(TestCase):
