@@ -1409,7 +1409,8 @@ class QuicConnection:
             max_datagram_size=self._max_datagram_size,
             peer_completed_address_validation=not self._is_client,
             quic_logger=self._quic_logger,
-            send_probe=lambda: self._send_probe,
+            # TODO: the lambda wrapper is probably unnecessary here
+            send_probe=lambda: self._send_probe(),
             logger=self._logger,
         )
         network_path = QuicNetworkPath(
