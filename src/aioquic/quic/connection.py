@@ -494,6 +494,9 @@ class QuicConnection:
         # blocked at all if every one of them is fully usable.
 
         if cids_blocked_path_id is not None:
+            # a path ID we could use is available, but the peer hasn't
+            # given us an unused connection ID for it yet - report
+            # PATH_CIDS_BLOCKED so the peer knows to send one
             stock_path = self._network_paths_stock.get(cids_blocked_path_id)
             if stock_path is not None and stock_path.peer_cid_sequence_numbers:
                 next_sequence_number = max(stock_path.peer_cid_sequence_numbers) + 1
@@ -503,6 +506,9 @@ class QuicConnection:
         elif self._remote_max_path_id is not None:
             num_paths = len(self._network_paths) + len(self._network_paths_stock)
             if num_paths > self._remote_max_path_id:
+                # every path ID we could use is already active/stocked,
+                # and the peer's own advertised limit is the reason we
+                # can't have more - report PATHS_BLOCKED
                 self._paths_blocked_pending = self._remote_max_path_id
 
         return False
