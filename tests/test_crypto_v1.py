@@ -355,3 +355,59 @@ class CryptoTest(TestCase):
         send(pair1, pair2, 3)
         self.assertEqual(pair1.key_phase, 1)
         self.assertEqual(pair2.key_phase, 1)
+
+    def test_encrypt_path_id_changes_ciphertext(self):
+        # Using a different path_id for the same packet number must yield
+        # a different nonce, and therefore different ciphertext - this is
+        # the core security property multipath relies on to safely reuse
+        # packet numbers across independent per-path packet number spaces.
+        pair = self.create_crypto(is_client=True)
+
+        packet_path_0 = pair.encrypt_packet(
+            LONG_CLIENT_PLAIN_HEADER,
+            LONG_CLIENT_PLAIN_PAYLOAD,
+            LONG_CLIENT_PACKET_NUMBER,
+            path_id=0,
+        )
+        packet_path_1 = pair.encrypt_packet(
+            LONG_CLIENT_PLAIN_HEADER,
+            LONG_CLIENT_PLAIN_PAYLOAD,
+            LONG_CLIENT_PACKET_NUMBER,
+            path_id=1,
+        )
+        self.assertNotEqual(packet_path_0, packet_path_1)
+
+        # path_id=0 is the default and must match the non-multipath
+        # (pre-existing) test vector exactly
+        self.assertEqual(packet_path_0, LONG_CLIENT_ENCRYPTED_PACKET)
+
+    def test_decrypt_path_id_roundtrip(self):
+        pair1 = self.create_crypto(is_client=True)
+        pair2 = self.create_crypto(is_client=False)
+
+        for path_id in (0, 1, 5, 2**32 - 1):
+            encrypted = pair1.encrypt_packet(
+                LONG_CLIENT_PLAIN_HEADER,
+                LONG_CLIENT_PLAIN_PAYLOAD,
+                LONG_CLIENT_PACKET_NUMBER,
+                path_id=path_id,
+            )
+            plain_header, plain_payload, packet_number = pair2.decrypt_packet(
+                encrypted, 18, 0, path_id=path_id
+            )
+            self.assertEqual(plain_header, LONG_CLIENT_PLAIN_HEADER)
+            self.assertEqual(plain_payload, LONG_CLIENT_PLAIN_PAYLOAD)
+            self.assertEqual(packet_number, LONG_CLIENT_PACKET_NUMBER)
+
+    def test_decrypt_wrong_path_id_fails(self):
+        pair1 = self.create_crypto(is_client=True)
+        pair2 = self.create_crypto(is_client=False)
+
+        encrypted = pair1.encrypt_packet(
+            LONG_CLIENT_PLAIN_HEADER,
+            LONG_CLIENT_PLAIN_PAYLOAD,
+            LONG_CLIENT_PACKET_NUMBER,
+            path_id=1,
+        )
+        with self.assertRaises(CryptoError):
+            pair2.decrypt_packet(encrypted, 18, 0, path_id=2)
