@@ -479,24 +479,13 @@ class QuicConnection:
 
                 return True
             elif not stock_path.peer_cid_available and cids_blocked_path_id is None:
-                # a path ID exists but we have no unused connection ID for
-                # it yet - candidate to report via PATH_CIDS_BLOCKED
+                # candidate to report via PATH_CIDS_BLOCKED:
+                # a path ID exists but we have no unused connection ID
                 cids_blocked_path_id = path_id
 
-        # No usable stock path found above. Every path ID up to
-        # min(self._max_path_id, self._remote_max_path_id) is eagerly
-        # given a _network_paths/_network_paths_stock entry as soon as
-        # that limit is known (see _setup_paths_in_stock, called both at
-        # handshake confirmation and whenever max_path_id rises on either
-        # side), so the loop above already covers every path ID we could
-        # possibly want to activate: cids_blocked_path_id already points
-        # at the first one lacking a peer CID if any do, or nothing is
-        # blocked at all if every one of them is fully usable.
-
+        # trigger PATH_CIDS_BLOCKED or PATHS_BLOCKED frame transmission
         if cids_blocked_path_id is not None:
-            # a path ID we could use is available, but the peer hasn't
-            # given us an unused connection ID for it yet - report
-            # PATH_CIDS_BLOCKED so the peer knows to send one
+            # PATH_CIDS_BLOCKED as path ID available but no peer connection ID
             stock_path = self._network_paths_stock.get(cids_blocked_path_id)
             if stock_path is not None and stock_path.peer_cid_sequence_numbers:
                 next_sequence_number = max(stock_path.peer_cid_sequence_numbers) + 1
@@ -504,11 +493,9 @@ class QuicConnection:
                 next_sequence_number = 0
             self._path_cids_blocked_pending[cids_blocked_path_id] = next_sequence_number
         elif self._remote_max_path_id is not None:
+            # PATHS_BLOCKED as host allows for more paths than peer
             num_paths = len(self._network_paths) + len(self._network_paths_stock)
             if num_paths > self._remote_max_path_id:
-                # every path ID we could use is already active/stocked,
-                # and the peer's own advertised limit is the reason we
-                # can't have more - report PATHS_BLOCKED
                 self._paths_blocked_pending = self._remote_max_path_id
 
         return False
@@ -2626,11 +2613,9 @@ class QuicConnection:
         """
         Handle a PATHS_BLOCKED frame.
 
-        This frame is informational (draft-ietf-quic-multipath section
+        This frame is informational (draft-ietf-quic-multipath-21 section
         4.7): it does not imply any particular action from the peer.
-        For now we just log it for observability; a later addition could
-        decide to react by calling `raise_max_path_id()` (subject to
-        local policy on whether/how much to grow the path ID limit).
+        For now it is just logged for observability
         """
         maximum_path_id = buf.pull_uint_var()
 
@@ -2652,9 +2637,9 @@ class QuicConnection:
         """
         Handle a PATH_CIDS_BLOCKED frame.
 
-        This frame is informational (draft-ietf-quic-multipath section
-        4.7): it does not imply any particular action, such as issuing
-        more connection IDs. We just log it for observability.
+        This frame is informational (draft-ietf-quic-multipath-21 section
+        4.7): it does not imply any particular action from the peer. 
+        For now it is just logged for observability
         """
         path_id = buf.pull_uint_var()
         next_sequence_number = buf.pull_uint_var()
@@ -2853,14 +2838,7 @@ class QuicConnection:
     ) -> None:
         """
         Callback when a PATHS_BLOCKED frame is acknowledged or lost.
-
-        The draft only states that repeating this frame after it was
-        successfully received but not acted upon is pointless (draft-
-        ietf-quic-multipath section 4.7); it says nothing about a frame
-        that was lost in transit and never actually reached the peer.
-        Since the underlying condition (still at the peer's path ID
-        limit) typically persists, we re-arm sending on loss, but only
-        if nothing more recent has already superseded it.
+        Re-arm on loss if nothing more recent set.
         """
         if delivery != QuicDeliveryState.ACKED and self._paths_blocked_pending is None:
             self._paths_blocked_pending = max_path_id
@@ -2870,10 +2848,7 @@ class QuicConnection:
     ) -> None:
         """
         Callback when a PATH_CIDS_BLOCKED frame is acknowledged or lost.
-
-        Same rationale as `_on_paths_blocked_delivery`: re-arm on loss
-        unless a more recent report for the same path has already
-        superseded it.
+        Re-arm on loss if nothing more recent set.
         """
         if (
             delivery != QuicDeliveryState.ACKED
