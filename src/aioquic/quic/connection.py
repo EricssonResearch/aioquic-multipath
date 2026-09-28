@@ -447,7 +447,12 @@ class QuicConnection:
         )
         if not self._multipath_negotiated or not self._handshake_confirmed:
             return False
-        
+
+        num_paths = len(self._network_paths) + len(self._network_paths_stock)
+        if self._max_path_id < num_paths:
+            # self-blocked
+            return False
+
         # find a stock path with CIDs ready
         cids_blocked_path_id = None
         for path_id, stock_path in list(self._network_paths_stock.items()):
@@ -494,9 +499,7 @@ class QuicConnection:
             self._path_cids_blocked_pending[cids_blocked_path_id] = next_sequence_number
         elif self._remote_max_path_id is not None:
             # PATHS_BLOCKED as host allows for more paths than peer
-            num_paths = len(self._network_paths) + len(self._network_paths_stock)
-            if num_paths > self._remote_max_path_id:
-                self._paths_blocked_pending = self._remote_max_path_id
+            self._paths_blocked_pending = self._remote_max_path_id
 
         return False
 
