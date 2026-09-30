@@ -1152,7 +1152,7 @@ class QuicConnection:
     def raise_max_path_id(self, max_path_id: int) -> bool:
         """
         Increase the maximum path ID this endpoint is willing to accept
-        from the peer, and arrange for a MAX_PATH_ID frame to be sent.
+        from the peer, and prepare potentially increased number of paths.
 
         Returns `True` if the limit was raised, `False` if `max_path_id`
         is not greater than the current limit (a no-op, per the draft's
@@ -1163,17 +1163,14 @@ class QuicConnection:
         :param max_path_id: The new maximum path ID, must be <= 2**32-1.
         """
         assert max_path_id <= 2**32 - 1, "max_path_id must be <= 2**32-1"
+        if not self._multipath_negotiated:
+            return False
         if self._max_path_id is not None and max_path_id <= self._max_path_id:
             return False
         self._max_path_id = max_path_id
 
-        # Raising our own limit can unblock stock paths for path IDs the
-        # peer already allows (min(self._max_path_id, self._remote_max_path_id)
-        # may increase even though the peer's own limit did not change) -
-        # set them up eagerly, same as when a MAX_PATH_ID frame raises the
-        # peer's limit instead.
-        if self._multipath_negotiated:
-            self._setup_paths_in_stock()
+        # prepare additional paths for multipath
+        self._setup_paths_in_stock()
         return True
 
     def reset_stream(self, stream_id: int, error_code: int) -> None:
@@ -2618,6 +2615,13 @@ class QuicConnection:
         """
         Handle a MAX_PATH_ID frame.
         """
+        if not self._multipath_negotiated:
+            raise QuicConnectionError(
+                error_code=QuicErrorCode.FRAME_ENCODING_ERROR,
+                frame_type=frame_type,
+                reason_phrase="multipath frame when multipath not negotiated",
+            )
+        
         max_path_id = buf.pull_uint_var()
 
         # log frame
@@ -2633,20 +2637,12 @@ class QuicConnection:
                 reason_phrase="Maximum Path Identifier must be <= 2^32-1",
             )
 
-        # Loss or reordering can cause a MAX_PATH_ID frame to arrive with a
-        # value lower than one already received; such frames MUST be
-        # ignored rather than treated as an error.
-        if self._remote_max_path_id is None or max_path_id > self._remote_max_path_id:
+        # update only on higher value
+        if max_path_id > self._remote_max_path_id:
             self._remote_max_path_id = max_path_id
 
-            # Eagerly create stock paths for the newly permitted range,
-            # consistent with the handshake-time behaviour in
-            # _setup_paths_in_stock(): initial_max_path_id and MAX_PATH_ID
-            # are both peer-controlled values already bounded by our own
-            # max_path_id, so there is no reason to treat a mid-connection
-            # increase any more cautiously than the handshake-time one.
-            if self._multipath_negotiated:
-                self._setup_paths_in_stock()
+            # prepare additional paths for multipath
+            self._setup_paths_in_stock()
 
     def _handle_stop_sending_frame(
         self, context: QuicReceiveContext, frame_type: int, buf: Buffer
