@@ -8,6 +8,7 @@ from typing import (
     Any,
     Callable,
     Deque,
+    Dict,
     FrozenSet,
     Optional,
     Sequence,
@@ -440,7 +441,9 @@ class QuicConnection:
     def add_unvalidated_path(self, addr_remote: NetworkAddress, addr_local: NetworkAddress) -> bool:
         """
         Activate a stock path for use. Returns True if successful.
-        Requires: multipath negotiated, stock path available with CIDs on both sides.
+        Triggers PATHS_BLOCKED frame if no path in stock and peer is limiting or
+        PATH_CIDS_BLOCKED if stock path lacks CIDs from peer.
+        Requires: multipath negotiated.
         """
         assert self._is_client and self._handshake_complete, (
             "only client can add an additional path and handshake must be completed"
@@ -448,12 +451,14 @@ class QuicConnection:
         if not self._multipath_negotiated or not self._handshake_confirmed:
             return False
 
-        num_paths = len(self._network_paths) + len(self._network_paths_stock)
-        if self._max_path_id < num_paths:
-            # self-blocked
+        # check PATHS_BLOCKED
+        if len(self._network_paths_stock) == 0:
+            if self._max_path_id >= self._remote_max_path_id:
+                self._paths_blocked_pending = self._remote_max_path_id
+            # else: self-blocked
             return False
 
-        # find a stock path with CIDs ready
+        # try to activate stock path with CIDs ready
         cids_blocked_path_id = None
         for path_id, stock_path in list(self._network_paths_stock.items()):
             if stock_path.peer_cid_available and stock_path.host_cids:
@@ -483,23 +488,19 @@ class QuicConnection:
                 self._logger.info(f"Activate path {path_id} with path tuple {addr_local}, {addr_remote}.")
 
                 return True
+
             elif not stock_path.peer_cid_available and cids_blocked_path_id is None:
                 # candidate to report via PATH_CIDS_BLOCKED:
-                # a path ID exists but we have no unused connection ID
                 cids_blocked_path_id = path_id
 
-        # trigger PATH_CIDS_BLOCKED or PATHS_BLOCKED frame transmission
+        # trigger PATH_CIDS_BLOCKED frame transmission
         if cids_blocked_path_id is not None:
-            # PATH_CIDS_BLOCKED as path ID available but no peer connection ID
-            stock_path = self._network_paths_stock.get(cids_blocked_path_id)
-            if stock_path is not None and stock_path.peer_cid_sequence_numbers:
-                next_sequence_number = max(stock_path.peer_cid_sequence_numbers) + 1
+            blocked_path = self._network_paths_stock[cids_blocked_path_id]
+            if blocked_path.peer_cid_sequence_numbers:
+                next_sequence_number = max(blocked_path.peer_cid_sequence_numbers) + 1
             else:
                 next_sequence_number = 0
             self._path_cids_blocked_pending[cids_blocked_path_id] = next_sequence_number
-        elif self._remote_max_path_id is not None:
-            # PATHS_BLOCKED as host allows for more paths than peer
-            self._paths_blocked_pending = self._remote_max_path_id
 
         return False
 
