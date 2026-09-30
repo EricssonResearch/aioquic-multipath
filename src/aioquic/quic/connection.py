@@ -315,6 +315,7 @@ class QuicConnection:
         self._max_ack_delay = 0.025
         self._max_datagram_size = configuration.max_datagram_size
         self._max_path_id = configuration.max_path_id
+        self._max_path_id_sent = configuration.max_path_id
         self._network_paths: dict[int, QuicNetworkPath] = {}
         self._network_paths_stock: dict[int, QuicNetworkPath] = {}
         self._path_ids: dict[bytes, int] = {}
@@ -425,6 +426,7 @@ class QuicConnection:
             0x3f: (self._handle_path_ack_frame, EPOCHS("1")),
             0x3e78: (self._handle_path_new_connection_id_frame, EPOCHS("1")),
             0x3e79: (self._handle_path_retire_connection_id_frame, EPOCHS("1")),
+            0x3e7a: (self._handle_max_path_id_frame, EPOCHS("1")),
             0x3e7b: (self._handle_paths_blocked_frame, EPOCHS("1")),
             0x3e7c: (self._handle_path_cids_blocked_frame, EPOCHS("1")),
 
@@ -1175,6 +1177,25 @@ class QuicConnection:
         assert self._handshake_complete, "cannot change key before handshake completes"
         self._cryptos[tls.Epoch.ONE_RTT].update_key()
 
+    def raise_max_path_id(self, max_path_id: int) -> bool:
+        """
+        Increase the maximum path ID this endpoint is willing to accept
+        from the peer, and arrange for a MAX_PATH_ID frame to be sent.
+
+        Returns `True` if the limit was raised, `False` if `max_path_id`
+        is not greater than the current limit (a no-op, per the draft's
+        "MUST be ignored" rule for non-increasing values).
+
+        .. aioquic_transmit::
+
+        :param max_path_id: The new maximum path ID, must be <= 2**32-1.
+        """
+        assert max_path_id <= 2**32 - 1, "max_path_id must be <= 2**32-1"
+        if self._max_path_id is not None and max_path_id <= self._max_path_id:
+            return False
+        self._max_path_id = max_path_id
+        return True
+
     def reset_stream(self, stream_id: int, error_code: int) -> None:
         """
         Abruptly terminate the sending part of a stream.
@@ -1416,7 +1437,7 @@ class QuicConnection:
             max_datagram_size=self._max_datagram_size,
             peer_completed_address_validation=not self._is_client,
             quic_logger=self._quic_logger,
-            send_probe=lambda: self._send_probe,
+            send_probe=self._send_probe,
             logger=self._logger,
         )
         network_path = QuicNetworkPath(
@@ -2611,6 +2632,33 @@ class QuicConnection:
         # issue a new connection ID
         self._replenish_connection_ids(path_id)
 
+    def _handle_max_path_id_frame(
+        self, context: QuicReceiveContext, frame_type: int, buf: Buffer
+    ) -> None:
+        """
+        Handle a MAX_PATH_ID frame.
+        """
+        max_path_id = buf.pull_uint_var()
+
+        # log frame
+        if self._quic_logger is not None:
+            context.quic_logger_frames.append(
+                self._quic_logger.encode_max_path_id_frame(max_path_id=max_path_id)
+            )
+
+        if max_path_id > 2**32 - 1:
+            raise QuicConnectionError(
+                error_code=QuicErrorCode.PROTOCOL_VIOLATION,
+                frame_type=frame_type,
+                reason_phrase="Maximum Path Identifier must be <= 2^32-1",
+            )
+
+        # Loss or reordering can cause a MAX_PATH_ID frame to arrive with a
+        # value lower than one already received; such frames MUST be
+        # ignored rather than treated as an error.
+        if self._remote_max_path_id is None or max_path_id > self._remote_max_path_id:
+            self._remote_max_path_id = max_path_id
+
     def _handle_paths_blocked_frame(
         self, context: QuicReceiveContext, frame_type: int, buf: Buffer
     ) -> None:
@@ -2836,6 +2884,15 @@ class QuicConnection:
         """
         if delivery != QuicDeliveryState.ACKED:
             limit.sent = 0
+
+    def _on_max_path_id_delivery(
+        self, delivery: QuicDeliveryState, max_path_id: int
+    ) -> None:
+        """
+        Callback when a MAX_PATH_ID frame is acknowledged or lost.
+        """
+        if delivery != QuicDeliveryState.ACKED and self._max_path_id_sent == max_path_id:
+            self._max_path_id_sent = None
 
     def _on_paths_blocked_delivery(
         self, delivery: QuicDeliveryState, max_path_id: int
@@ -3665,6 +3722,10 @@ class QuicConnection:
                 # MAX_DATA and MAX_STREAMS
                 self._write_connection_limits(builder=builder, space=space)
 
+                # MAX_PATH_ID
+                if self._multipath_negotiated:
+                    self._write_max_path_id_frame(builder=builder)
+
                 # PATHS_BLOCKED and PATH_CIDS_BLOCKED
                 if self._multipath_negotiated:
                     self._write_paths_blocked_frame(builder=builder)
@@ -3972,6 +4033,28 @@ class QuicConnection:
                         self._quic_logger.encode_connection_limit_frame(
                             frame_type=limit.frame_type,
                             maximum=limit.value,
+                        )
+                    )
+
+    def _write_max_path_id_frame(self, builder: QuicPacketBuilder) -> None:
+        """
+        Raise MAX_PATH_ID if needed.
+        """
+        if self._max_path_id != self._max_path_id_sent:
+            buf = builder.start_frame(
+                QuicFrameType.MAX_PATH_ID,
+                capacity=MAX_PATH_ID_FRAME_CAPACITY,
+                handler=self._on_max_path_id_delivery,
+                handler_args=(self._max_path_id,),
+            )
+            buf.push_uint_var(self._max_path_id)
+            self._max_path_id_sent = self._max_path_id
+
+            # log frame
+            if self._quic_logger is not None:
+                builder.quic_logger_frames.append(
+                    self._quic_logger.encode_max_path_id_frame(
+                        max_path_id=self._max_path_id
                         )
                     )
 
