@@ -2448,7 +2448,9 @@ class QuicConnectionTest(TestCase):
 
     def test_raise_max_path_id(self):
         with client_and_server() as (client, server):
-            self.assertIsNone(client._max_path_id)
+            client._multipath_negotiated = True
+            client._max_path_id = 0
+            client._remote_max_path_id = 0
 
             self.assertTrue(client.raise_max_path_id(2))
             self.assertEqual(client._max_path_id, 2)
@@ -2523,7 +2525,9 @@ class QuicConnectionTest(TestCase):
 
     def test_handle_max_path_id_frame(self):
         with client_and_server() as (client, server):
-            self.assertIsNone(client._remote_max_path_id)
+            client._multipath_negotiated = True
+            client._max_path_id = 0
+            client._remote_max_path_id = 0
 
             client._handle_max_path_id_frame(
                 client_receive_context(client),
@@ -2589,6 +2593,9 @@ class QuicConnectionTest(TestCase):
 
     def test_handle_max_path_id_frame_too_large(self):
         with client_and_server() as (client, server):
+            client._multipath_negotiated = True
+            client._max_path_id = 0
+            client._remote_max_path_id = 0
             with self.assertRaises(QuicConnectionError) as cm:
                 client._handle_max_path_id_frame(
                     client_receive_context(client),
