@@ -2690,19 +2690,41 @@ class QuicConnectionTest(TestCase):
 
     def test_handle_paths_blocked_frame(self):
         with client_and_server() as (client, server):
+            client._multipath_negotiated = True
             client._handle_paths_blocked_frame(
                 client_receive_context(client),
                 QuicFrameType.PATHS_BLOCKED,
                 Buffer(data=encode_uint_var(3)),
             )
 
+    def test_handle_paths_blocked_frame_without_multipath_negotiated(self):
+        with client_and_server() as (client, server):
+            with self.assertRaises(QuicConnectionError) as cm:
+                client._handle_paths_blocked_frame(
+                    client_receive_context(client),
+                    QuicFrameType.PATHS_BLOCKED,
+                    Buffer(data=encode_uint_var(3)),
+                )
+            self.assertEqual(cm.exception.error_code, QuicErrorCode.FRAME_ENCODING_ERROR)
+
     def test_handle_path_cids_blocked_frame(self):
         with client_and_server() as (client, server):
+            client._multipath_negotiated = True
             client._handle_path_cids_blocked_frame(
                 client_receive_context(client),
                 QuicFrameType.PATH_CIDS_BLOCKED,
                 Buffer(data=encode_uint_var(1) + encode_uint_var(4)),
             )
+
+    def test_handle_path_cids_blocked_frame_without_multipath_negotiated(self):
+        with client_and_server() as (client, server):
+            with self.assertRaises(QuicConnectionError) as cm:
+                client._handle_path_cids_blocked_frame(
+                    client_receive_context(client),
+                    QuicFrameType.PATH_CIDS_BLOCKED,
+                    Buffer(data=encode_uint_var(1) + encode_uint_var(4)),
+                )
+            self.assertEqual(cm.exception.error_code, QuicErrorCode.FRAME_ENCODING_ERROR)
 
     def test_on_paths_blocked_delivery(self):
         with client_and_server() as (client, server):
