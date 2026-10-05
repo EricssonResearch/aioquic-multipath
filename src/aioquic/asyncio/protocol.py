@@ -103,13 +103,11 @@ class QuicConnectionProtocol(asyncio.DatagramProtocol):
     ) -> bool:
         # initiate QUIC path creation with retry, e.g., when CID not ready
         if self._quic._multipath_negotiated: 
-            num_paths = len(self._quic._network_paths) + len(self._quic._network_paths_stock)
-            if self._quic._max_path_id + 1 > num_paths:
-                for _ in range(retry_cap):
-                    if self._quic.add_unvalidated_path(addr_remote, addr_local):
-                        self.transmit()
-                        return True
-                    await asyncio.sleep(0.1)
+            for _ in range(retry_cap):
+                if self._quic.add_unvalidated_path(addr_remote, addr_local):
+                    self.transmit()
+                    return True
+                await asyncio.sleep(0.1)
         return False
 
     async def add_interface(
