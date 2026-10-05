@@ -2602,6 +2602,165 @@ class QuicConnectionTest(TestCase):
                 "Maximum Path Identifier must be <= 2^32-1",
             )
 
+    def test_add_unvalidated_path_reports_path_cids_blocked_for_existing_path(self):
+        with client_and_server() as (client, server):
+            client._multipath_negotiated = True
+            client._max_path_id = 1
+            client._remote_max_path_id = 1
+
+            # a stock path exists for path ID 1 (we know the path ID and
+            # have our own host CIDs replenished for it) but the peer has
+            # not yet sent us any connection IDs to use on it
+            client._create_network_path(
+                path_id=1, host_cid=None, peer_cid=None, path_tuple=None, stock=True
+            )
+            client._replenish_connection_ids(1)
+            self.assertEqual(client._network_paths_stock[1].peer_cid_available, [])
+
+            self.assertFalse(
+                client.add_unvalidated_path(SERVER_ADDR, CLIENT_ADDR)
+            )
+            self.assertEqual(client._path_cids_blocked_pending, {1: 0})
+            self.assertIsNone(client._paths_blocked_pending)
+
+    def test_add_unvalidated_path_reports_paths_blocked(self):
+        with client_and_server() as (client, server):
+            client._multipath_negotiated = True
+            client._max_path_id = 1
+            client._remote_max_path_id = 0
+
+            # path ID 0 is already active; the peer allows nothing beyond
+            # that, so we are blocked by the max path ID limit itself
+            self.assertFalse(
+                client.add_unvalidated_path(SERVER_ADDR, CLIENT_ADDR)
+            )
+            self.assertIsNone(client._path_cids_blocked_pending.get(0))
+            self.assertEqual(client._paths_blocked_pending, 0)
+
+    def test_add_unvalidated_path_never_reports_path_id_beyond_local_max(self):
+        with client_and_server() as (client, server):
+            client._multipath_negotiated = True
+            # our own limit (0) is lower than what the peer allows (5): we
+            # must never report a candidate path ID beyond our own limit,
+            # even though it would otherwise be "valid" per the peer
+            client._max_path_id = 0
+            client._remote_max_path_id = 5
+
+            self.assertFalse(
+                client.add_unvalidated_path(SERVER_ADDR, CLIENT_ADDR)
+            )
+            self.assertEqual(client._path_cids_blocked_pending, {})
+            self.assertIsNone(client._paths_blocked_pending)
+
+    def test_write_paths_blocked_frame(self):
+        with client_and_server() as (client, server):
+            client._paths_blocked_pending = 3
+
+            network_path = client._network_paths[0]
+            builder = QuicPacketBuilder(
+                host_cid=network_path.host_cid,
+                is_client=True,
+                max_datagram_size=SMALLEST_MAX_DATAGRAM_SIZE,
+                peer_cid=network_path.peer_cid.cid,
+                version=client._version,
+            )
+            crypto = client._cryptos[tls.Epoch.ONE_RTT]
+            builder.start_packet(QuicPacketType.ONE_RTT, crypto)
+            client._write_paths_blocked_frame(builder=builder)
+            self.assertFalse(builder.packet_is_empty)
+            self.assertIsNone(client._paths_blocked_pending)
+
+    def test_write_path_cids_blocked_frame(self):
+        with client_and_server() as (client, server):
+            client._path_cids_blocked_pending = {1: 4}
+
+            network_path = client._network_paths[0]
+            builder = QuicPacketBuilder(
+                host_cid=network_path.host_cid,
+                is_client=True,
+                max_datagram_size=SMALLEST_MAX_DATAGRAM_SIZE,
+                peer_cid=network_path.peer_cid.cid,
+                version=client._version,
+            )
+            crypto = client._cryptos[tls.Epoch.ONE_RTT]
+            builder.start_packet(QuicPacketType.ONE_RTT, crypto)
+            client._write_path_cids_blocked_frame(builder=builder)
+            self.assertFalse(builder.packet_is_empty)
+            self.assertEqual(client._path_cids_blocked_pending, {})
+
+    def test_handle_paths_blocked_frame(self):
+        with client_and_server() as (client, server):
+            client._multipath_negotiated = True
+            client._handle_paths_blocked_frame(
+                client_receive_context(client),
+                QuicFrameType.PATHS_BLOCKED,
+                Buffer(data=encode_uint_var(3)),
+            )
+
+    def test_handle_paths_blocked_frame_without_multipath_negotiated(self):
+        with client_and_server() as (client, server):
+            with self.assertRaises(QuicConnectionError) as cm:
+                client._handle_paths_blocked_frame(
+                    client_receive_context(client),
+                    QuicFrameType.PATHS_BLOCKED,
+                    Buffer(data=encode_uint_var(3)),
+                )
+            self.assertEqual(cm.exception.error_code, QuicErrorCode.FRAME_ENCODING_ERROR)
+
+    def test_handle_path_cids_blocked_frame(self):
+        with client_and_server() as (client, server):
+            client._multipath_negotiated = True
+            client._handle_path_cids_blocked_frame(
+                client_receive_context(client),
+                QuicFrameType.PATH_CIDS_BLOCKED,
+                Buffer(data=encode_uint_var(1) + encode_uint_var(4)),
+            )
+
+    def test_handle_path_cids_blocked_frame_without_multipath_negotiated(self):
+        with client_and_server() as (client, server):
+            with self.assertRaises(QuicConnectionError) as cm:
+                client._handle_path_cids_blocked_frame(
+                    client_receive_context(client),
+                    QuicFrameType.PATH_CIDS_BLOCKED,
+                    Buffer(data=encode_uint_var(1) + encode_uint_var(4)),
+                )
+            self.assertEqual(cm.exception.error_code, QuicErrorCode.FRAME_ENCODING_ERROR)
+
+    def test_on_paths_blocked_delivery(self):
+        with client_and_server() as (client, server):
+            # a lost frame is re-armed if nothing more recent superseded it
+            client._paths_blocked_pending = None
+            client._on_paths_blocked_delivery(QuicDeliveryState.LOST, 3)
+            self.assertEqual(client._paths_blocked_pending, 3)
+
+            # if a newer report is already pending, do not overwrite it
+            client._paths_blocked_pending = 5
+            client._on_paths_blocked_delivery(QuicDeliveryState.LOST, 3)
+            self.assertEqual(client._paths_blocked_pending, 5)
+
+            # acked frames are never re-armed
+            client._paths_blocked_pending = None
+            client._on_paths_blocked_delivery(QuicDeliveryState.ACKED, 3)
+            self.assertIsNone(client._paths_blocked_pending)
+
+    def test_on_path_cids_blocked_delivery(self):
+        with client_and_server() as (client, server):
+            # a lost frame is re-armed if nothing more recent superseded it
+            client._path_cids_blocked_pending = {}
+            client._on_path_cids_blocked_delivery(QuicDeliveryState.LOST, 1, 4)
+            self.assertEqual(client._path_cids_blocked_pending, {1: 4})
+
+            # if a newer report for the same path is already pending,
+            # do not overwrite it
+            client._path_cids_blocked_pending = {1: 7}
+            client._on_path_cids_blocked_delivery(QuicDeliveryState.LOST, 1, 4)
+            self.assertEqual(client._path_cids_blocked_pending, {1: 7})
+
+            # acked frames are never re-armed
+            client._path_cids_blocked_pending = {}
+            client._on_path_cids_blocked_delivery(QuicDeliveryState.ACKED, 1, 4)
+            self.assertEqual(client._path_cids_blocked_pending, {})
+
     def test_handle_stop_sending_frame(self):
         with client_and_server() as (client, server):
             # client creates bidirectional stream 0

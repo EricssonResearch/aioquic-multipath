@@ -8,6 +8,7 @@ from typing import (
     Any,
     Callable,
     Deque,
+    Dict,
     FrozenSet,
     Optional,
     Sequence,
@@ -318,6 +319,8 @@ class QuicConnection:
         self._network_paths: dict[int, QuicNetworkPath] = {}
         self._network_paths_stock: dict[int, QuicNetworkPath] = {}
         self._path_ids: dict[bytes, int] = {}
+        self._paths_blocked_pending: Optional[int] = None
+        self._path_cids_blocked_pending: dict[int, int] = {} # path_id: next_sequence_number
         self._peer_token = configuration.token
         self._quic_logger: Optional[QuicLoggerTrace] = None
         self._remote_ack_delay_exponent = 3
@@ -424,6 +427,8 @@ class QuicConnection:
             0x3e78: (self._handle_path_new_connection_id_frame, EPOCHS("1")),
             0x3e79: (self._handle_path_retire_connection_id_frame, EPOCHS("1")),
             0x3e7a: (self._handle_max_path_id_frame, EPOCHS("1")),
+            0x3e7b: (self._handle_paths_blocked_frame, EPOCHS("1")),
+            0x3e7c: (self._handle_path_cids_blocked_frame, EPOCHS("1")),
 
         }
 
@@ -438,15 +443,25 @@ class QuicConnection:
     def add_unvalidated_path(self, addr_remote: NetworkAddress, addr_local: NetworkAddress) -> bool:
         """
         Activate a stock path for use. Returns True if successful.
-        Requires: multipath negotiated, stock path available with CIDs on both sides.
+        Triggers PATHS_BLOCKED frame if no path in stock and peer is limiting or
+        PATH_CIDS_BLOCKED if stock path lacks CIDs from peer.
+        Requires: multipath negotiated.
         """
         assert self._is_client and self._handshake_complete, (
             "only client can add an additional path and handshake must be completed"
         )
         if not self._multipath_negotiated or not self._handshake_confirmed:
             return False
-        
-        # find a stock path with CIDs ready
+
+        # check PATHS_BLOCKED
+        if len(self._network_paths_stock) == 0:
+            if self._max_path_id >= self._remote_max_path_id:
+                self._paths_blocked_pending = self._remote_max_path_id
+            # else: self-blocked
+            return False
+
+        # try to activate stock path with CIDs ready
+        cids_blocked_path_id = None
         for path_id, stock_path in list(self._network_paths_stock.items()):
             if stock_path.peer_cid_available and stock_path.host_cids:
                 # assign 4-tuple
@@ -475,6 +490,19 @@ class QuicConnection:
                 self._logger.info(f"Activate path {path_id} with path tuple {addr_local}, {addr_remote}.")
 
                 return True
+
+            elif not stock_path.peer_cid_available and cids_blocked_path_id is None:
+                # candidate to report via PATH_CIDS_BLOCKED:
+                cids_blocked_path_id = path_id
+
+        # trigger PATH_CIDS_BLOCKED frame transmission
+        if cids_blocked_path_id is not None:
+            blocked_path = self._network_paths_stock[cids_blocked_path_id]
+            if blocked_path.peer_cid_sequence_numbers:
+                next_sequence_number = max(blocked_path.peer_cid_sequence_numbers) + 1
+            else:
+                next_sequence_number = 0
+            self._path_cids_blocked_pending[cids_blocked_path_id] = next_sequence_number
 
         return False
 
@@ -2644,6 +2672,70 @@ class QuicConnection:
             # prepare additional paths for multipath
             self._setup_paths_in_stock()
 
+    def _handle_paths_blocked_frame(
+        self, context: QuicReceiveContext, frame_type: int, buf: Buffer
+    ) -> None:
+        """
+        Handle a PATHS_BLOCKED frame.
+
+        This frame is informational (draft-ietf-quic-multipath-21 section
+        4.7): it does not imply any particular action from the peer.
+        For now it is just logged for observability
+        """
+        if not self._multipath_negotiated:
+            raise QuicConnectionError(
+                error_code=QuicErrorCode.FRAME_ENCODING_ERROR,
+                frame_type=frame_type,
+                reason_phrase="multipath frame when multipath not negotiated",
+            )
+
+        maximum_path_id = buf.pull_uint_var()
+
+        # log frame
+        if self._quic_logger is not None:
+            context.quic_logger_frames.append(
+                self._quic_logger.encode_paths_blocked_frame(
+                    maximum_path_id=maximum_path_id
+                )
+            )
+
+        self._logger.info(
+            f"Peer reported PATHS_BLOCKED at maximum path ID {maximum_path_id}."
+        )
+
+    def _handle_path_cids_blocked_frame(
+        self, context: QuicReceiveContext, frame_type: int, buf: Buffer
+    ) -> None:
+        """
+        Handle a PATH_CIDS_BLOCKED frame.
+
+        This frame is informational (draft-ietf-quic-multipath-21 section
+        4.7): it does not imply any particular action from the peer. 
+        For now it is just logged for observability
+        """
+        if not self._multipath_negotiated:
+            raise QuicConnectionError(
+                error_code=QuicErrorCode.FRAME_ENCODING_ERROR,
+                frame_type=frame_type,
+                reason_phrase="multipath frame when multipath not negotiated",
+            )
+
+        path_id = buf.pull_uint_var()
+        next_sequence_number = buf.pull_uint_var()
+
+        # log frame
+        if self._quic_logger is not None:
+            context.quic_logger_frames.append(
+                self._quic_logger.encode_path_cids_blocked_frame(
+                    path_id=path_id, next_sequence_number=next_sequence_number
+                )
+            )
+
+        self._logger.info(
+            f"Peer reported PATH_CIDS_BLOCKED for path {path_id} "
+            f"at next sequence number {next_sequence_number}."
+        )
+
     def _handle_stop_sending_frame(
         self, context: QuicReceiveContext, frame_type: int, buf: Buffer
     ) -> None:
@@ -2828,6 +2920,29 @@ class QuicConnection:
         """
         if delivery != QuicDeliveryState.ACKED and self._max_path_id_sent == max_path_id:
             self._max_path_id_sent = None
+
+    def _on_paths_blocked_delivery(
+        self, delivery: QuicDeliveryState, max_path_id: int
+    ) -> None:
+        """
+        Callback when a PATHS_BLOCKED frame is acknowledged or lost.
+        Re-arm on loss if nothing more recent set.
+        """
+        if delivery != QuicDeliveryState.ACKED and self._paths_blocked_pending is None:
+            self._paths_blocked_pending = max_path_id
+
+    def _on_path_cids_blocked_delivery(
+        self, delivery: QuicDeliveryState, path_id: int, next_sequence_number: int
+    ) -> None:
+        """
+        Callback when a PATH_CIDS_BLOCKED frame is acknowledged or lost.
+        Re-arm on loss if nothing more recent set.
+        """
+        if (
+            delivery != QuicDeliveryState.ACKED
+            and path_id not in self._path_cids_blocked_pending
+        ):
+            self._path_cids_blocked_pending[path_id] = next_sequence_number
 
     def _on_handshake_done_delivery(self, delivery: QuicDeliveryState) -> None:
         """
@@ -3638,6 +3753,11 @@ class QuicConnection:
                 if self._multipath_negotiated:
                     self._write_max_path_id_frame(builder=builder)
 
+                # PATHS_BLOCKED and PATH_CIDS_BLOCKED
+                if self._multipath_negotiated:
+                    self._write_paths_blocked_frame(builder=builder)
+                    self._write_path_cids_blocked_frame(builder=builder)
+
             # stream-level limits
             for stream in self._streams.values():
                 self._write_stream_limits(builder=builder, space=space, stream=stream)
@@ -3961,7 +4081,54 @@ class QuicConnection:
             if self._quic_logger is not None:
                 builder.quic_logger_frames.append(
                     self._quic_logger.encode_max_path_id_frame(
-                        max_path_id=self._max_path_id,
+                        max_path_id=self._max_path_id
+                        )
+                    )
+
+    def _write_paths_blocked_frame(self, builder: QuicPacketBuilder) -> None:
+        """
+        Send a pending PATHS_BLOCKED frame, if any.
+        """
+        if self._paths_blocked_pending is not None:
+            max_path_id = self._paths_blocked_pending
+            buf = builder.start_frame(
+                QuicFrameType.PATHS_BLOCKED,
+                capacity=PATHS_BLOCKED_CAPACITY,
+                handler=self._on_paths_blocked_delivery,
+                handler_args=(max_path_id,),
+            )
+            buf.push_uint_var(max_path_id)
+            self._paths_blocked_pending = None
+
+            # log frame
+            if self._quic_logger is not None:
+                builder.quic_logger_frames.append(
+                    self._quic_logger.encode_paths_blocked_frame(
+                        maximum_path_id=max_path_id,
+                    )
+                )
+
+    def _write_path_cids_blocked_frame(self, builder: QuicPacketBuilder) -> None:
+        """
+        Send any pending PATH_CIDS_BLOCKED frames.
+        """
+        for path_id in list(self._path_cids_blocked_pending.keys()):
+            next_sequence_number = self._path_cids_blocked_pending.pop(path_id)
+            buf = builder.start_frame(
+                QuicFrameType.PATH_CIDS_BLOCKED,
+                capacity=PATH_CIDS_BLOCKED_CAPACITY,
+                handler=self._on_path_cids_blocked_delivery,
+                handler_args=(path_id, next_sequence_number),
+            )
+            buf.push_uint_var(path_id)
+            buf.push_uint_var(next_sequence_number)
+
+            # log frame
+            if self._quic_logger is not None:
+                builder.quic_logger_frames.append(
+                    self._quic_logger.encode_path_cids_blocked_frame(
+                        path_id=path_id,
+                        next_sequence_number=next_sequence_number,
                     )
                 )
 
