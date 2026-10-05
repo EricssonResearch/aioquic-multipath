@@ -2682,6 +2682,13 @@ class QuicConnection:
         4.7): it does not imply any particular action from the peer.
         For now it is just logged for observability
         """
+        if not self._multipath_negotiated:
+            raise QuicConnectionError(
+                error_code=QuicErrorCode.FRAME_ENCODING_ERROR,
+                frame_type=frame_type,
+                reason_phrase="multipath frame when multipath not negotiated",
+            )
+
         maximum_path_id = buf.pull_uint_var()
 
         # log frame
@@ -2706,6 +2713,13 @@ class QuicConnection:
         4.7): it does not imply any particular action from the peer. 
         For now it is just logged for observability
         """
+        if not self._multipath_negotiated:
+            raise QuicConnectionError(
+                error_code=QuicErrorCode.FRAME_ENCODING_ERROR,
+                frame_type=frame_type,
+                reason_phrase="multipath frame when multipath not negotiated",
+            )
+
         path_id = buf.pull_uint_var()
         next_sequence_number = buf.pull_uint_var()
 
