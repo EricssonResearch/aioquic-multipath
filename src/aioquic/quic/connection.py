@@ -2849,7 +2849,7 @@ class QuicConnection:
         """
         if (
             delivery != QuicDeliveryState.ACKED
-            and network_path.local_status_seq == sequence_number
+            and network_path.local_status_seq - 1 == sequence_number
             and network_path.local_status_sent
         ):
             network_path.local_status_sent = False
