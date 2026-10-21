@@ -6,7 +6,7 @@ import pickle
 import ssl
 import time
 from collections import deque
-from typing import BinaryIO, Callable, Deque, List, Optional, Tuple, Union, cast
+from typing import BinaryIO, Callable, Deque, Optional, Union, cast
 from urllib.parse import urlparse
 
 import aioquic
@@ -361,7 +361,7 @@ async def main(
     local_port: int,
     key_update: bool,
     zero_rtt: bool,
-    additional_paths: Optional[List[Tuple[Optional[str], str, int]]] = None,
+    additional_paths: Optional[list[tuple[Optional[str], str, int]]] = None,
 ) -> None:
     # parse URL
     parsed = urlparse(urls[0])

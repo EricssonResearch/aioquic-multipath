@@ -58,7 +58,7 @@ class QuicLoggerTrace:
             "frame_type": "ack",
         }
     
-    def encode_path_ack_frame(self, ranges: RangeSet, delay: float, path_id: int, cid: bytes) -> Dict:
+    def encode_path_ack_frame(self, ranges: RangeSet, delay: float, path_id: int, cid: bytes) -> dict:
         return {
             "path_id": path_id,
             "ack_delay": str(self.encode_time(delay)),
@@ -156,7 +156,7 @@ class QuicLoggerTrace:
         retire_prior_to: int,
         sequence_number: int,
         stateless_reset_token: bytes,
-    ) -> Dict:
+    ) -> dict:
         return {
             "path_id": path_id,
             "connection_id": hexdump(connection_id),

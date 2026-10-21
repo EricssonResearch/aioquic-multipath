@@ -5,7 +5,7 @@ import logging
 import time
 from collections import deque
 from email.utils import formatdate
-from typing import Callable, Deque, List, Optional, Tuple, Union, cast
+from typing import Callable, Deque, Optional, Union, cast
 
 import aioquic
 import wsproto
@@ -486,7 +486,7 @@ async def main(
     configuration: QuicConfiguration,
     session_ticket_store: SessionTicketStore,
     retry: bool,
-    additional_interfaces: Optional[List[Tuple[str, int]]] = None,
+    additional_interfaces: Optional[list[tuple[str, int]]] = None,
 ) -> None:
     await serve(
         host,
